@@ -24,12 +24,6 @@
             </xacro:unless>
         </hardware>
 
-        <!-- IMPORTANT!
-        As it is currently implemented, multiple interfaces targeting different indices of a PLC variable of type ARRAY[x]
-        MUST be defined in ascending order starting at 0! (0, 1, 2...).
-        Declaring indices descending or out-of-order (2, 1, 0) causes mismatch between hw_states/command buffers and byte buffers received from PLC
-        -->
-
         <!-- These interfaces can be declared for any component - joint, gpio or sensor -->
 
         <gpio name="robot_io">
