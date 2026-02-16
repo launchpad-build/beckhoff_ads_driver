@@ -1,6 +1,6 @@
 # beckhoff_ads_hardware_interface for ROS 2
 Copyright (c) 2025, b-robotized. All rights reserved.
-Author: Nikola Banovic
+Author: Nikola Banovic Contributor: Hajar Bartakh
 
 This package provides a `ros2_control` **SystemInterface** for communicating with Beckhoff TwinCAT PLCs. It acts as a transport layer, allowing `ros2_control` controllers to read from and write to PLC variables (e.g., joint states, GPIOs, sensor values) over the network.
 
@@ -118,6 +118,18 @@ ros2 topic echo /controller_manager/introspection_data/full
 ## Troubleshooting
 
 For troubleshooting network connection with TwinCAT 3 XAE, refer to [the documentation](https://download.beckhoff.com/download/document/automation/twincat3/TwinCAT_3_ADS_INTRO_EN.pdf), especially chapters 7. and 8.
+
+*Please note that the two following issues were encountered while running the TwinCAT 3 XAE example project on a Windows Virtual Machine.*
+
+### TwinCAT 3 XAE Crash on Windows 11 VM 
+The issue occurs when switching off `Run Mode` inside `TwinCAT 3 XAE`. `TwinCAT`crashes afterwards and reboots the VM.   
+The core isolation was responsible for the bug. Isolated cores can be removed from the project's `Real time Settings`. 
+
+### ADS Connection Failure 
+The ADS connection may be [refused](https://epics.cosylab.com/documentation/adsDriver/troubleshooting/index.html#ioc-fails-to-connect-with-read-frame-failed-with-error-connection-reset-by-peer-errors) even though both the PLC and the host machine can ping each other.   
+The ADS router does not seem to recognize the physical IP address of the host. The host-side **virtual IP address** should be the one used instead for the route in `TwinCAT 3 XAE` and inside the `URDF`.    
+In our case for example, it corresponds to the interface `virbr0`.
+
 
 # Future Plans
 Feel free to contribute on any of these!
