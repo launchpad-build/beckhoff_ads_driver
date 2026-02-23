@@ -17,7 +17,7 @@ Authors: Nikola Banovic Dr. Denis
 -->
 
 <launch>
-    <arg name="mock_hardware" default="true" />
+    <arg name="mock_hardware" default="false" />
     <arg name="mock_sensor_commands" default="false"/>
 
     <let name="robot_description_content" value="$(command '$(find-exec xacro) $(find-pkg-share beckhoff_ads_bringup)/urdf/beckhoff_bot.urdf.xacro mock_hardware:=$(var mock_hardware) mock_sensor_commands:=$(var mock_sensor_commands)')"/>
@@ -34,4 +34,3 @@ Authors: Nikola Banovic Dr. Denis
     </node>
 
 </launch>
-

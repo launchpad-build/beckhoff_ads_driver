@@ -6,6 +6,7 @@
   <description>Ros2Control hardware interface for integrating with Beckhoff PLC</description>
   <author email="nikola.banovic@b-robotized.com">Nikola Banovic </author>
   <maintainer email="nikola.banovic@b-robotized.com">Nikola Banovic</maintainer>
+  <maintainer email="bartakh.hajar@gmail.com">Hajar Bartakh</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
