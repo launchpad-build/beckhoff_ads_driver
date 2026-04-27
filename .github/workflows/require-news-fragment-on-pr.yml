@@ -1,0 +1,9 @@
+name: Require news fragment on pull request
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    uses: launchpad-build/shared-workflows/.github/workflows/require-news-fragment.yml@2.0.0
