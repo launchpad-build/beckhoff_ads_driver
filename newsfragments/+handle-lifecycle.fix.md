@@ -1,0 +1,1 @@
+Hold the AdsHandle returned by GetHandle for the lifetime of each ADSDataLayout so SYM_RELEASEHND no longer fires immediately on resolve. Struct and array-of-struct member symbols can now be read without crashing the worker thread.
