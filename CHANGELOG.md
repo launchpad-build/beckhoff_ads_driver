@@ -2,6 +2,13 @@
 
 <!-- towncrier release notes start -->
 
+## 1.1.1 (2026-05-19)
+
+### Fixes
+
+- Hold the AdsHandle returned by GetHandle for the lifetime of each ADSDataLayout so SYM_RELEASEHND no longer fires immediately on resolve. Struct and array-of-struct member symbols can now be read without crashing the worker thread.
+
+
 ## 1.1.0 (2026-04-29)
 
 ### Features
