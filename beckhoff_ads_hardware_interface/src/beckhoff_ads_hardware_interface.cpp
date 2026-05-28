@@ -21,8 +21,13 @@
 namespace beckhoff_ads_hardware_interface
 {
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_init(
-        const hardware_interface::HardwareComponentParams & /*params*/)
+        const hardware_interface::HardwareComponentInterfaceParams &params)
     {
+        if (hardware_interface::SystemInterface::on_init(params) != CallbackReturn::SUCCESS)
+        {
+            return CallbackReturn::ERROR;
+        }
+
         logging_throttle_clock_ = std::make_shared<rclcpp::Clock>(RCL_STEADY_TIME);
 
         return CallbackReturn::SUCCESS;

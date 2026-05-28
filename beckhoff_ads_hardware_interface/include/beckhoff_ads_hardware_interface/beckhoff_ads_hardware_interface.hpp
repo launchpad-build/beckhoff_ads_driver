@@ -100,7 +100,7 @@ namespace beckhoff_ads_hardware_interface
   class BeckhoffADSHardwareInterface : public hardware_interface::SystemInterface
   {
   public:
-    hardware_interface::CallbackReturn on_init(const hardware_interface::HardwareComponentParams &params);
+    hardware_interface::CallbackReturn on_init(const hardware_interface::HardwareComponentInterfaceParams &params) override;
 
     hardware_interface::CallbackReturn on_configure(
         const rclcpp_lifecycle::State &previous_state) override;
