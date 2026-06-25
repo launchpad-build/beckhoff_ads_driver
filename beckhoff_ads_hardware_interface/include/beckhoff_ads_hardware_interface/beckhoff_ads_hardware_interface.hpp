@@ -12,8 +12,14 @@
 #ifndef beckhoff_ads_hardware_interface__BECKHOFF_SYSTEM_HPP_
 #define beckhoff_ads_hardware_interface__BECKHOFF_SYSTEM_HPP_
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 #include <limits>
 
@@ -100,6 +106,8 @@ namespace beckhoff_ads_hardware_interface
   class BeckhoffADSHardwareInterface : public hardware_interface::SystemInterface
   {
   public:
+    ~BeckhoffADSHardwareInterface() override; // joins the I/O threads if a lifecycle shutdown did not
+
     hardware_interface::CallbackReturn on_init(const hardware_interface::HardwareComponentInterfaceParams &params) override;
 
     hardware_interface::CallbackReturn on_configure(
@@ -134,6 +142,12 @@ namespace beckhoff_ads_hardware_interface
     std::unique_ptr<AdsDevice> ads_device_; // Manages the route/connection to the PLC
     bool configure_ads_device();
 
+    // Releases every cached PLC symbol handle (ADSDataLayout::ads_handle_owner). Each handle's
+    // deleter calls DeleteSymbolHandle through ads_device_, so this MUST run while ads_device_
+    // is still alive, i.e. before resetting/replacing it. Otherwise the deleters dereference a
+    // freed device and segfault (seen on Ctrl-C teardown).
+    void release_ads_handles();
+
     // Metadata (populated in on interface export)
     // Describes each variable on the PLC
     std::vector<ADSDataLayout> ads_item_layouts_read_;
@@ -158,6 +172,41 @@ namespace beckhoff_ads_hardware_interface
 
     std::vector<ReadInstruction> ads_read_instructions_;
     std::vector<WriteInstruction> ads_write_instructions_;
+
+    // ===== Background ADS I/O threads ==========================================
+    // The blocking ADS SUM read/write round-trips are moved off the control loop.
+    // read()/write() only touch lock-free caches and a coalescing buffer, so the
+    // control-loop cycle time no longer depends on PLC/network latency.
+
+    void start_io_threads(); // spawns the writer and reader threads
+    void stop_io_threads();  // signals and joins both worker threads; safe to call when idle
+
+    // Serialises the reader's and writer's ADS round-trips. ads_device_ owns a single local AMS
+    // port, and the underlying library allows only one in-flight request per port. Without this
+    // the writer's port reservation collides with the reader's in-flight read and fails. Held
+    // only around each ReadWriteReqEx2 call, never the control loop, so read()/write() stay
+    // non-blocking.
+    std::mutex ads_io_mutex_;
+
+    // Writer thread: owns the SUM-write round-trip. write() marshals the latest command
+    // buffer, hands it over here, and returns. Only the newest buffer is sent (coalescing).
+    void writer_loop();
+    std::thread write_thread_;
+    std::mutex write_mutex_;
+    std::condition_variable write_cv_;
+    std::vector<uint8_t> write_pending_request_; // latest packed SUM-write request awaiting send
+    bool write_pending_ = false;                 // a fresh buffer is waiting (guarded by write_mutex_)
+    bool write_stop_ = false;                     // stop request (guarded by write_mutex_)
+    std::atomic<bool> write_comms_ok_{true};      // last write transaction health, surfaced by write()
+
+    // Reader thread: owns the SUM-read round-trip. Decodes each sample into
+    // polling_read_cache_; read() loads from it without blocking.
+    void reader_loop();
+    std::thread read_thread_;
+    std::atomic<bool> read_stop_{false};
+    std::atomic<bool> read_comms_ok_{true};         // last read transaction health, surfaced by read()
+    std::deque<std::atomic<double>> polling_read_cache_; // one slot per read instruction; deque keeps addresses stable
+    long long read_poll_period_ns_ = 0;             // optional pacing between SUM reads; 0 = unpaced
   };
 
 } // namespace beckhoff_ads_hardware_interface
