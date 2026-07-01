@@ -2,6 +2,17 @@
 
 <!-- towncrier release notes start -->
 
+## 1.3.0 (2026-07-01)
+
+### Features
+
+- Move the blocking ADS SUM read and write off the control loop onto dedicated worker threads. `write()` marshals the latest command buffer, hands it to a writer thread, and returns. The writer sends only the newest buffer, so no backlog builds. A reader thread runs the SUM read and caches the result for a non-blocking `read()`. The control-loop cycle time no longer tracks PLC or network latency. This clears the controller-manager overrun warnings at high update rates. An optional `read_poll_period_ms` hardware parameter paces the reader to cap PLC load.
+
+### Fixes
+
+- Release cached PLC symbol handles while the ADS device is still alive, before shutdown resets it or reconfigure replaces it. Each handle deleter calls `DeleteSymbolHandle` through the device. Releasing a handle after the device is gone dereferenced freed memory and segfaulted on Ctrl-C.
+
+
 ## 1.2.0 (2026-05-28)
 
 ### Features

@@ -1,1 +1,0 @@
-Release cached PLC symbol handles while the ADS device is still alive, before shutdown resets it or reconfigure replaces it. Each handle deleter calls `DeleteSymbolHandle` through the device. Releasing a handle after the device is gone dereferenced freed memory and segfaulted on Ctrl-C.
