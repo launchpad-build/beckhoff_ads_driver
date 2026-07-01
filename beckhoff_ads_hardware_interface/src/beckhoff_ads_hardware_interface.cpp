@@ -12,6 +12,9 @@
 #include <limits>
 #include <vector>
 #include <cstdint>
+#include <cstring> // std::memcpy
+#include <chrono>
+#include <thread>
 #include <algorithm> // std::transform
 
 #include "beckhoff_ads_hardware_interface/beckhoff_ads_hardware_interface.hpp"
@@ -20,6 +23,82 @@
 
 namespace beckhoff_ads_hardware_interface
 {
+    namespace
+    {
+        // Decodes one PLC element at src into a double. Shared by read() and the reader thread
+        // so the two never diverge. Returns NaN for unsupported types.
+        double decode_plc_element(PLCType plc_type, const uint8_t *src)
+        {
+            switch (plc_type)
+            {
+            case PLCType::LREAL:
+            {
+                double v;
+                std::memcpy(&v, src, sizeof(v));
+                return v;
+            }
+            case PLCType::REAL:
+            {
+                float v;
+                std::memcpy(&v, src, sizeof(v));
+                return static_cast<double>(v);
+            }
+            case PLCType::BOOL:
+            {
+                uint8_t v;
+                std::memcpy(&v, src, sizeof(v));
+                return (v != 0) ? 1.0 : 0.0;
+            }
+            case PLCType::SINT:
+            {
+                int8_t v;
+                std::memcpy(&v, src, sizeof(v));
+                return static_cast<double>(v);
+            }
+            case PLCType::USINT:
+            case PLCType::BYTE:
+            {
+                uint8_t v;
+                std::memcpy(&v, src, sizeof(v));
+                return static_cast<double>(v);
+            }
+            case PLCType::INT:
+            {
+                int16_t v;
+                std::memcpy(&v, src, sizeof(v));
+                return static_cast<double>(v);
+            }
+            case PLCType::UINT:
+            {
+                uint16_t v;
+                std::memcpy(&v, src, sizeof(v));
+                return static_cast<double>(v);
+            }
+            case PLCType::DINT:
+            {
+                int32_t v;
+                std::memcpy(&v, src, sizeof(v));
+                return static_cast<double>(v);
+            }
+            case PLCType::UDINT:
+            {
+                uint32_t v;
+                std::memcpy(&v, src, sizeof(v));
+                return static_cast<double>(v);
+            }
+            default:
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+        }
+    } // namespace
+
+    BeckhoffADSHardwareInterface::~BeckhoffADSHardwareInterface()
+    {
+        // Backstop if no lifecycle shutdown ran: a joinable std::thread would call std::terminate.
+        // ads_device_ outlives the threads (declared first), so an in-flight ADS call completes.
+        stop_io_threads();
+    }
+
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_init(
         const hardware_interface::HardwareComponentInterfaceParams &params)
     {
@@ -36,6 +115,29 @@ namespace beckhoff_ads_hardware_interface
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_configure(
         const rclcpp_lifecycle::State & /*previous_state*/)
     {
+        // Release any symbol handles from a previous configure cycle before configure_ads_device()
+        // replaces ads_device_ below; the handle deleters call through ads_device_.
+        release_ads_handles();
+
+        // Optional pacing between SUM reads, to cap PLC load. Absent or invalid = unpaced.
+        read_poll_period_ns_ = 0;
+        try
+        {
+            auto period_it = info_.hardware_parameters.find("read_poll_period_ms");
+            if (period_it != info_.hardware_parameters.end())
+            {
+                const double ms = std::stod(period_it->second);
+                if (std::isfinite(ms) && ms > 0.0)
+                {
+                    read_poll_period_ns_ = static_cast<long long>(ms * 1e6);
+                }
+            }
+        }
+        catch (const std::exception &ex)
+        {
+            RCLCPP_WARN(getLogger(), "Invalid read_poll_period_ms: %s. Running unpaced.", ex.what());
+        }
+
         // Configure ADS Client Device
         if (!configure_ads_device())
         {
@@ -160,6 +262,15 @@ namespace beckhoff_ads_hardware_interface
             current_data_offset += header.NumBytesData;
             current_error_offset += sizeof(uint32_t);
         }
+        // One cache slot per read instruction for the reader thread. Default to NaN so read()
+        // reports "no sample yet" until the first SUM read completes. A deque keeps each slot's
+        // address stable; std::atomic<double> is neither copyable nor movable.
+        polling_read_cache_.clear();
+        for (size_t i = 0; i < ads_read_instructions_.size(); ++i)
+        {
+            polling_read_cache_.emplace_back(std::numeric_limits<double>::quiet_NaN());
+        }
+
         RCLCPP_INFO(getLogger(), "ADS Sum READ configured for %zu items. Request: %zu bytes, Response: %zu bytes.",
                     num_items_read_, ads_buffer_sum_read_request_.size(), ads_buffer_sum_read_response_.size());
         return true;
@@ -406,6 +517,7 @@ namespace beckhoff_ads_hardware_interface
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_activate(
         const rclcpp_lifecycle::State & /*previous_state*/)
     {
+        start_io_threads();
         return CallbackReturn::SUCCESS;
     }
 
@@ -413,148 +525,105 @@ namespace beckhoff_ads_hardware_interface
         const rclcpp_lifecycle::State & /*previous_state*/)
     {
         // TODO: send some safety commands to the PLC?
+        stop_io_threads();
         return CallbackReturn::SUCCESS;
     }
 
     hardware_interface::return_type BeckhoffADSHardwareInterface::read(
         const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
     {
+        // The reader thread performs the SUM read off the control loop and decodes into
+        // polling_read_cache_. Here we only publish the latest cached values.
         if (num_items_read_ == 0)
         {
             return hardware_interface::return_type::OK;
         }
 
-        uint32_t bytes_read_from_plc = 0;
-        long ads_sum_read_error = ads_device_->ReadWriteReqEx2(
-            ADSIGRP_SUMUP_READ,
-            num_items_read_,
-            ads_buffer_sum_read_response_.size(),
-            ads_buffer_sum_read_response_.data(),
-            ads_buffer_sum_read_request_.size(),
-            ads_buffer_sum_read_request_.data(),
-            &bytes_read_from_plc);
-
-        if (ads_sum_read_error != ADSERR_NOERR)
+        for (size_t i = 0; i < ads_read_instructions_.size(); ++i)
         {
-            RCLCPP_ERROR_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
-                                  "Overall ADS Sum Read Error: 0x%lX.", ads_sum_read_error);
-            // TODO: See if we need to do something on read error. Maybe assign NaN to all interfaces?
-            return hardware_interface::return_type::ERROR;
+            set_state(ads_read_instructions_[i].state_interface_name,
+                      polling_read_cache_[i].load(std::memory_order_acquire));
         }
+        return read_comms_ok_.load(std::memory_order_acquire)
+                   ? hardware_interface::return_type::OK
+                   : hardware_interface::return_type::ERROR;
+    }
 
-        if (bytes_read_from_plc != ads_buffer_sum_read_response_.size())
+    void BeckhoffADSHardwareInterface::reader_loop()
+    {
+        // Back off after a failure so a broken link does not spin at full CPU.
+        constexpr auto ERROR_BACKOFF = std::chrono::milliseconds(10);
+
+        while (!read_stop_.load(std::memory_order_acquire))
         {
-            RCLCPP_ERROR_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
-                                  "ADS Sum Read size mismatch. Expected %zu, Got %u.",
-                                  ads_buffer_sum_read_response_.size(), bytes_read_from_plc);
-            return hardware_interface::return_type::ERROR;
-        }
+            const auto cycle_start = std::chrono::steady_clock::now();
 
-        bool any_item_read_failed = false;
-        for (const auto &read_instruction : ads_read_instructions_)
-        {
-            uint32_t item_error_code;
-            memcpy(&item_error_code,
-                   ads_buffer_sum_read_response_.data() + read_instruction.read_buffer_offset_error_code,
-                   sizeof(uint32_t));
-
-            if (item_error_code != ADSERR_NOERR)
+            // Only the reader touches the read response buffer, so decode happens outside the
+            // lock; the lock only guards the shared single-port round-trip against the writer.
+            uint32_t bytes_read_from_plc = 0;
+            long ads_sum_read_error;
             {
-                RCLCPP_WARN_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
-                                     "ADS Sum Read operation corresponding to the state interface '%s' failed: 0x%X.",
-                                     read_instruction.state_interface_name.c_str(), item_error_code);
+                std::lock_guard<std::mutex> io_lock(ads_io_mutex_);
+                ads_sum_read_error = ads_device_->ReadWriteReqEx2(
+                    ADSIGRP_SUMUP_READ,
+                    num_items_read_,
+                    ads_buffer_sum_read_response_.size(),
+                    ads_buffer_sum_read_response_.data(),
+                    ads_buffer_sum_read_request_.size(),
+                    ads_buffer_sum_read_request_.data(),
+                    &bytes_read_from_plc);
+            }
 
-                // TODO: See if we need to do something on read error. Maybe assign NaN to the interface?
-                any_item_read_failed = true;
+            if (ads_sum_read_error != ADSERR_NOERR)
+            {
+                RCLCPP_ERROR_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
+                                      "Overall ADS Sum Read Error: 0x%lX.", ads_sum_read_error);
+                read_comms_ok_.store(false, std::memory_order_release);
+                std::this_thread::sleep_for(ERROR_BACKOFF);
                 continue;
             }
 
-            // Each state interface has its corresponding read_instruction
-            const uint8_t *ptr_plc_element_current = ads_buffer_sum_read_response_.data() + read_instruction.read_buffer_offset_data;
-
-            // TODO: performance - Hoist the switch/case above for loop?
-
-            switch (read_instruction.plc_type)
+            if (bytes_read_from_plc != ads_buffer_sum_read_response_.size())
             {
-            case PLCType::LREAL:
-            {
-                double val;
-                memcpy(&val, ptr_plc_element_current, plcTypeByteSize(read_instruction.plc_type));
-                set_state(read_instruction.state_interface_name, val);
-                break;
-            }
-            case PLCType::REAL:
-            {
-                float val;
-                memcpy(&val, ptr_plc_element_current, plcTypeByteSize(read_instruction.plc_type));
-                set_state(read_instruction.state_interface_name, static_cast<double>(val));
-                break;
-            }
-            case PLCType::BOOL:
-            {
-                uint8_t byte_val;
-                memcpy(&byte_val, ptr_plc_element_current, plcTypeByteSize(read_instruction.plc_type));
-                set_state(read_instruction.state_interface_name, (byte_val != 0) ? 1.0 : 0.0);
-                break;
-            }
-            case PLCType::SINT:
-            {
-                int8_t val;
-                memcpy(&val, ptr_plc_element_current, plcTypeByteSize(read_instruction.plc_type));
-                set_state(read_instruction.state_interface_name, static_cast<double>(val));
-                break;
-            }
-            case PLCType::USINT:
-            case PLCType::BYTE:
-            {
-                uint8_t val;
-                memcpy(&val, ptr_plc_element_current, plcTypeByteSize(read_instruction.plc_type));
-                set_state(read_instruction.state_interface_name, static_cast<double>(val));
-                break;
-            }
-            case PLCType::INT:
-            {
-                int16_t val;
-                memcpy(&val, ptr_plc_element_current, plcTypeByteSize(read_instruction.plc_type));
-                set_state(read_instruction.state_interface_name, static_cast<double>(val));
-                break;
-            }
-            case PLCType::UINT:
-            {
-                uint16_t val;
-                memcpy(&val, ptr_plc_element_current, plcTypeByteSize(read_instruction.plc_type));
-                set_state(read_instruction.state_interface_name, static_cast<double>(val));
-                break;
-            }
-            case PLCType::DINT:
-            {
-                int32_t val;
-                memcpy(&val, ptr_plc_element_current, plcTypeByteSize(read_instruction.plc_type));
-                set_state(read_instruction.state_interface_name, static_cast<double>(val));
-                break;
-            }
-            case PLCType::UDINT:
-            {
-                uint32_t val;
-                memcpy(&val, ptr_plc_element_current, plcTypeByteSize(read_instruction.plc_type));
-                set_state(read_instruction.state_interface_name, static_cast<double>(val));
-                break;
-            }
-            /* Not supported for now, guarded against in on_configure()
-            case PLCType::STRING:
-                break;
-            */
-            case PLCType::UNKNOWN:
-            default:
                 RCLCPP_ERROR_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
-                                      "Unhandled or UNKNOWN PLC type (%d) for the interface '%s' during read.",
-                                      static_cast<int>(read_instruction.plc_type), read_instruction.state_interface_name.c_str());
-                set_state(read_instruction.state_interface_name, std::numeric_limits<double>::quiet_NaN());
-                any_item_read_failed = true;
-                break;
+                                      "ADS Sum Read size mismatch. Expected %zu, Got %u.",
+                                      ads_buffer_sum_read_response_.size(), bytes_read_from_plc);
+                read_comms_ok_.store(false, std::memory_order_release);
+                std::this_thread::sleep_for(ERROR_BACKOFF);
+                continue;
+            }
+
+            bool any_item_read_failed = false;
+            for (size_t i = 0; i < ads_read_instructions_.size(); ++i)
+            {
+                const auto &read_instruction = ads_read_instructions_[i];
+                uint32_t item_error_code;
+                memcpy(&item_error_code,
+                       ads_buffer_sum_read_response_.data() + read_instruction.read_buffer_offset_error_code,
+                       sizeof(uint32_t));
+
+                if (item_error_code != ADSERR_NOERR)
+                {
+                    RCLCPP_WARN_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
+                                         "ADS Sum Read operation corresponding to the state interface '%s' failed: 0x%X.",
+                                         read_instruction.state_interface_name.c_str(), item_error_code);
+                    any_item_read_failed = true;
+                    continue;
+                }
+
+                const uint8_t *ptr_plc_element_current = ads_buffer_sum_read_response_.data() + read_instruction.read_buffer_offset_data;
+                polling_read_cache_[i].store(decode_plc_element(read_instruction.plc_type, ptr_plc_element_current),
+                                             std::memory_order_release);
+            }
+            read_comms_ok_.store(!any_item_read_failed, std::memory_order_release);
+
+            // Optional pacing to cap PLC load; period 0 = unpaced.
+            if (read_poll_period_ns_ > 0)
+            {
+                const auto target = cycle_start + std::chrono::nanoseconds(read_poll_period_ns_);
+                std::this_thread::sleep_until(target);
             }
         }
-        return any_item_read_failed ? hardware_interface::return_type::ERROR : hardware_interface::return_type::OK;
     }
 
     hardware_interface::return_type BeckhoffADSHardwareInterface::write(
@@ -661,51 +730,142 @@ namespace beckhoff_ads_hardware_interface
             }
         }
 
-        uint32_t bytes_response_buffer_from_plc = 0;
-        long ads_sum_write_error = ads_device_->ReadWriteReqEx2(
-            ADSIGRP_SUMUP_WRITE,
-            num_items_write_,
-            ads_buffer_sum_write_response_.size(),
-            ads_buffer_sum_write_response_.data(),
-            ads_buffer_sum_write_request_.size(),
-            ads_buffer_sum_write_request_.data(),
-            &bytes_response_buffer_from_plc);
-
-        if (ads_sum_write_error != ADSERR_NOERR)
+        // Hand the freshly packed request to the writer thread and return immediately. A newer
+        // buffer overwrites one not yet sent, so the writer never backlogs (only the latest
+        // setpoints matter).
         {
-            RCLCPP_ERROR_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
-                                  "Overall ADS Sum Write Error: 0x%lX.", ads_sum_write_error);
-            return hardware_interface::return_type::ERROR;
+            std::lock_guard<std::mutex> lock(write_mutex_);
+            write_pending_request_ = ads_buffer_sum_write_request_;
+            write_pending_ = true;
         }
+        write_cv_.notify_one();
 
-        if (bytes_response_buffer_from_plc != ads_buffer_sum_write_response_.size())
-        {
-            RCLCPP_ERROR_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
-                                  "ADS Sum Write response size mismatch (error codes). Expected %zu, Got %u.",
-                                  ads_buffer_sum_write_response_.size(), bytes_response_buffer_from_plc);
-        }
+        return write_comms_ok_.load(std::memory_order_acquire)
+                   ? hardware_interface::return_type::OK
+                   : hardware_interface::return_type::ERROR;
+    }
 
-        bool any_item_write_failed = false;
-        for (size_t i = 0; i < num_items_write_; ++i)
+    void BeckhoffADSHardwareInterface::writer_loop()
+    {
+        std::vector<uint8_t> send_buffer;
+        while (true)
         {
-            uint32_t item_error_code;
-            memcpy(&item_error_code, ads_buffer_sum_write_response_.data() + i * sizeof(uint32_t), sizeof(uint32_t));
-            if (item_error_code != ADSERR_NOERR)
             {
-                RCLCPP_WARN_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
-                                     "ADS Sum Write sub-op for '%s' (handle 0x%X) failed: 0x%X",
-                                     ads_item_layouts_write_[i].plc_name_symbolic.c_str(), ads_item_layouts_write_[i].ads_handle, item_error_code);
-                any_item_write_failed = true;
+                std::unique_lock<std::mutex> lock(write_mutex_);
+                write_cv_.wait(lock, [this]
+                               { return write_pending_ || write_stop_; });
+                if (write_stop_)
+                {
+                    break;
+                }
+                // O(1) swap, no copy. write() keeps its own stable buffer, so skipped fields
+                // retain their last value.
+                send_buffer.swap(write_pending_request_);
+                write_pending_ = false;
             }
+
+            // Lock only around the round-trip; the writer owns the write response buffer, so its
+            // error decoding below runs unlocked. The gap between the reader's round-trips lets
+            // the writer take the port, so it is not starved by the continuous reader.
+            uint32_t bytes_response_buffer_from_plc = 0;
+            long ads_sum_write_error;
+            {
+                std::lock_guard<std::mutex> io_lock(ads_io_mutex_);
+                ads_sum_write_error = ads_device_->ReadWriteReqEx2(
+                    ADSIGRP_SUMUP_WRITE,
+                    num_items_write_,
+                    ads_buffer_sum_write_response_.size(),
+                    ads_buffer_sum_write_response_.data(),
+                    send_buffer.size(),
+                    send_buffer.data(),
+                    &bytes_response_buffer_from_plc);
+            }
+
+            if (ads_sum_write_error != ADSERR_NOERR)
+            {
+                RCLCPP_ERROR_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
+                                      "Overall ADS Sum Write Error: 0x%lX.", ads_sum_write_error);
+                write_comms_ok_.store(false, std::memory_order_release);
+                continue;
+            }
+
+            if (bytes_response_buffer_from_plc != ads_buffer_sum_write_response_.size())
+            {
+                RCLCPP_ERROR_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
+                                      "ADS Sum Write response size mismatch (error codes). Expected %zu, Got %u.",
+                                      ads_buffer_sum_write_response_.size(), bytes_response_buffer_from_plc);
+            }
+
+            // One error code per write item, in request order: index i maps to layout i.
+            bool any_item_write_failed = false;
+            for (size_t i = 0; i < num_items_write_; ++i)
+            {
+                uint32_t item_error_code;
+                memcpy(&item_error_code, ads_buffer_sum_write_response_.data() + i * sizeof(uint32_t), sizeof(uint32_t));
+                if (item_error_code != ADSERR_NOERR)
+                {
+                    RCLCPP_WARN_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
+                                         "ADS Sum Write sub-op for '%s' (handle 0x%X) failed: 0x%X",
+                                         ads_item_layouts_write_[i].plc_name_symbolic.c_str(), ads_item_layouts_write_[i].ads_handle, item_error_code);
+                    any_item_write_failed = true;
+                }
+            }
+            write_comms_ok_.store(!any_item_write_failed, std::memory_order_release);
+        }
+    }
+
+    void BeckhoffADSHardwareInterface::start_io_threads()
+    {
+        // Clear any stale fault before (re)starting.
+        write_comms_ok_.store(true, std::memory_order_release);
+        read_comms_ok_.store(true, std::memory_order_release);
+
+        if (num_items_write_ > 0 && !write_thread_.joinable())
+        {
+            {
+                std::lock_guard<std::mutex> lock(write_mutex_);
+                write_stop_ = false;
+                write_pending_ = false;
+            }
+            write_thread_ = std::thread(&BeckhoffADSHardwareInterface::writer_loop, this);
         }
 
-        return any_item_write_failed ? hardware_interface::return_type::ERROR : hardware_interface::return_type::OK;
+        if (num_items_read_ > 0 && !read_thread_.joinable())
+        {
+            read_stop_.store(false, std::memory_order_release);
+            read_thread_ = std::thread(&BeckhoffADSHardwareInterface::reader_loop, this);
+        }
+    }
+
+    void BeckhoffADSHardwareInterface::stop_io_threads()
+    {
+        {
+            std::lock_guard<std::mutex> lock(write_mutex_);
+            write_stop_ = true;
+        }
+        write_cv_.notify_all();
+        if (write_thread_.joinable())
+        {
+            write_thread_.join();
+        }
+
+        read_stop_.store(true, std::memory_order_release);
+        if (read_thread_.joinable())
+        {
+            read_thread_.join();
+        }
     }
 
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_shutdown(
         const rclcpp_lifecycle::State & /*previous_state*/)
     {
         RCLCPP_INFO(getLogger(), "Releasing ADS resources...");
+        // Stop the worker threads before touching the device; both call through ads_device_.
+        // Safe to call even if on_deactivate already joined them.
+        stop_io_threads();
+        // Release symbol handles before the device: their deleters call DeleteSymbolHandle
+        // through ads_device_. Skipping this is what segfaulted on Ctrl-C.
+        release_ads_handles();
         if (ads_device_)
         {
             ads_device_.reset();
@@ -713,6 +873,20 @@ namespace beckhoff_ads_hardware_interface
         RCLCPP_INFO(getLogger(), "ADS resources released.");
 
         return hardware_interface::CallbackReturn::SUCCESS;
+    }
+
+    void BeckhoffADSHardwareInterface::release_ads_handles()
+    {
+        // reset() destroys the held AdsHandle, whose deleter releases the PLC symbol handle via
+        // ads_device_. Callers guarantee ads_device_ is still valid at this point.
+        for (auto &layout : ads_item_layouts_read_)
+        {
+            layout.ads_handle_owner.reset();
+        }
+        for (auto &layout : ads_item_layouts_write_)
+        {
+            layout.ads_handle_owner.reset();
+        }
     }
 
     bool BeckhoffADSHardwareInterface::configure_ads_device()
