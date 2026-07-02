@@ -12,10 +12,15 @@
 #include <limits>
 #include <vector>
 #include <cstdint>
-#include <cstring> // std::memcpy
-#include <chrono>
-#include <thread>
+#include <cstring>   // std::memcpy
 #include <algorithm> // std::transform
+#include <atomic>
+#include <chrono>
+#include <cmath>     // std::isnan
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <thread>    // std::this_thread::yield
 
 #include "beckhoff_ads_hardware_interface/beckhoff_ads_hardware_interface.hpp"
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
@@ -25,8 +30,9 @@ namespace beckhoff_ads_hardware_interface
 {
     namespace
     {
-        // Decodes one PLC element at src into a double. Shared by read() and the reader thread
-        // so the two never diverge. Returns NaN for unsupported types.
+        // Decodes one PLC element at src into a double. Shared by the reader thread and the
+        // notification callback so the two paths never diverge. Returns NaN for unsupported
+        // types (UNKNOWN/STRING are filtered out at configure time).
         double decode_plc_element(PLCType plc_type, const uint8_t *src)
         {
             switch (plc_type)
@@ -90,6 +96,137 @@ namespace beckhoff_ads_hardware_interface
                 return std::numeric_limits<double>::quiet_NaN();
             }
         }
+
+        // One destination per ROS state interface that targets a given PLC symbol.
+        struct ElementTarget
+        {
+            size_t sample_byte_offset;   // index * elem_byte_size within the symbol's sample
+            std::atomic<double> *dest;   // points into the owning context's stable storage
+        };
+
+        // Per-symbol decode context. Pooled and reused, never destroyed (see registry below).
+        struct NotificationContext
+        {
+            PLCType plc_type{PLCType::UNKNOWN};
+            size_t elem_byte_size{0};
+            uint32_t expected_sample_size{0};
+            std::deque<std::atomic<double>> values;   // one slot per interface; deque keeps addresses stable
+            std::vector<ElementTarget> targets;
+            std::atomic<bool> ready{false};           // gates decoding; cleared before a context is reused
+            std::atomic<int> active{0};               // in-flight callbacks; teardown drains this to zero
+            std::atomic<long long> last_update_steady_ns{0};
+        };
+
+        // Process-static context registry, indexed by the uint32_t hUser handed to ADS.
+        // Contexts are never destroyed: DeleteNotification does not join the dispatcher, so a
+        // callback can fire after its handle is deleted. Freed slots are reused instead, so the
+        // pool stays bounded by the peak count of live symbols.
+        std::deque<NotificationContext> g_context_pool;   // stable addresses; never shrinks
+        std::vector<uint32_t> g_free_indices;
+        std::mutex g_registry_mutex;
+
+        // Immutable snapshot the callback reads with one atomic load, so it takes no mutex.
+        // Republished on pool growth; old snapshots stay alive for in-flight callbacks.
+        using ContextSnapshot = std::vector<NotificationContext *>;
+        std::atomic<const ContextSnapshot *> g_context_snapshot{nullptr};
+        std::vector<std::unique_ptr<const ContextSnapshot>> g_snapshot_keepalive; // guarded by g_registry_mutex
+
+        long long steady_now_ns()
+        {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        }
+
+        // Rebuilds and publishes the index->context* snapshot. Caller must hold g_registry_mutex.
+        void republish_context_snapshot_locked()
+        {
+            auto snapshot = std::make_unique<ContextSnapshot>();
+            snapshot->reserve(g_context_pool.size());
+            for (auto &ctx : g_context_pool)
+            {
+                snapshot->push_back(&ctx);
+            }
+            const ContextSnapshot *published = snapshot.get();
+            g_snapshot_keepalive.push_back(std::move(snapshot));
+            g_context_snapshot.store(published, std::memory_order_release);
+        }
+
+        // Reserves a context slot, reusing a freed one when available. Returns its hUser index.
+        uint32_t acquire_context_slot()
+        {
+            std::lock_guard<std::mutex> lock(g_registry_mutex);
+            uint32_t index;
+            if (!g_free_indices.empty())
+            {
+                index = g_free_indices.back();
+                g_free_indices.pop_back();
+                // Its context* is already in the snapshot; addresses are stable.
+            }
+            else
+            {
+                index = static_cast<uint32_t>(g_context_pool.size());
+                g_context_pool.emplace_back();
+                republish_context_snapshot_locked();
+            }
+            return index;
+        }
+
+        // Returns a stable pointer into the never-relocating pool.
+        NotificationContext *context_at(uint32_t index)
+        {
+            std::lock_guard<std::mutex> lock(g_registry_mutex);
+            return &g_context_pool[index];
+        }
+
+        // Returns a slot to the free-list once its notification has been deleted. Drains any
+        // in-flight callback first so its fields can later be rewritten for reuse.
+        void release_context_slot(uint32_t index)
+        {
+            NotificationContext *ctx = context_at(index);
+            // Notification already deleted, so active only falls. Clear ready first so a late
+            // callback skips decoding.
+            ctx->ready.store(false, std::memory_order_release);
+            while (ctx->active.load(std::memory_order_acquire) != 0)
+            {
+                std::this_thread::yield();
+            }
+            std::lock_guard<std::mutex> lock(g_registry_mutex);
+            g_free_indices.push_back(index);
+        }
+
+        // Runs on the ADS dispatcher thread: stay fast, no ADS calls, no ros2_control handles,
+        // no mutex. Decodes the sample into the lock-free cache.
+        void notification_callback(const AmsAddr * /*addr*/,
+                                   const AdsNotificationHeader *header,
+                                   uint32_t hUser)
+        {
+            const ContextSnapshot *snapshot = g_context_snapshot.load(std::memory_order_acquire);
+            if (snapshot == nullptr || hUser >= snapshot->size())
+            {
+                return;
+            }
+            NotificationContext *ctx = (*snapshot)[hUser];
+            if (ctx == nullptr)
+            {
+                return;
+            }
+
+            // Mark busy so a concurrent teardown drains before reusing this context.
+            ctx->active.fetch_add(1, std::memory_order_acquire);
+            if (ctx->ready.load(std::memory_order_acquire) &&
+                header->cbSampleSize >= ctx->expected_sample_size)
+            {
+                const uint8_t *data = reinterpret_cast<const uint8_t *>(header + 1);
+                for (const auto &target : ctx->targets)
+                {
+                    target.dest->store(decode_plc_element(ctx->plc_type, data + target.sample_byte_offset),
+                                       std::memory_order_release);
+                }
+                ctx->last_update_steady_ns.store(steady_now_ns(), std::memory_order_relaxed);
+            }
+            ctx->active.fetch_sub(1, std::memory_order_release);
+        }
     } // namespace
 
     BeckhoffADSHardwareInterface::~BeckhoffADSHardwareInterface()
@@ -115,14 +252,51 @@ namespace beckhoff_ads_hardware_interface
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_configure(
         const rclcpp_lifecycle::State & /*previous_state*/)
     {
-        // Release any symbol handles from a previous configure cycle before configure_ads_device()
-        // replaces ads_device_ below; the handle deleters call through ads_device_.
+        // Tear down any notifications from a previous configure cycle while their owning
+        // AdsDevice is still alive. configure_ads_device() replaces ads_device_ below, which
+        // would otherwise leave the notification handle deleters pointing at a freed device.
+        teardown_notifications();
+        // Release prior-cycle symbol handles before the device is replaced (same hazard).
         release_ads_handles();
 
-        // Optional pacing between SUM reads, to cap PLC load. Absent or invalid = unpaced.
+        // Configure ADS Client Device
+        if (!configure_ads_device())
+        {
+            RCLCPP_FATAL(getLogger(), "Failed to configure ADS device from URDF parameters.");
+            return hardware_interface::CallbackReturn::ERROR;
+        }
+
+        // Select the read strategy. Default is the synchronous SUM read on a background thread.
+        // Set the <hardware> parameter read_mode="notification" to read via PLC-pushed ADS device
+        // notifications instead. The write path always uses the SUM write.
+        read_via_notifications_ = false;
+        {
+            auto it = info_.hardware_parameters.find("read_mode");
+            if (it != info_.hardware_parameters.end())
+            {
+                std::string mode = it->second;
+                std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
+                read_via_notifications_ = (mode == "notification" || mode == "notifications" ||
+                                           mode == "notify");
+            }
+            RCLCPP_INFO(getLogger(), "Read strategy: %s",
+                        read_via_notifications_ ? "ADS device notifications (push)"
+                                                : "synchronous SUM read (polling)");
+        }
+
+        notif_staleness_ns_ = 0;
         read_poll_period_ns_ = 0;
         try
         {
+            auto timeout_it = info_.hardware_parameters.find("notify_timeout_ms");
+            if (timeout_it != info_.hardware_parameters.end())
+            {
+                const double ms = std::stod(timeout_it->second);
+                if (std::isfinite(ms) && ms > 0.0)
+                {
+                    notif_staleness_ns_ = static_cast<long long>(ms * 1e6);
+                }
+            }
             auto period_it = info_.hardware_parameters.find("read_poll_period_ms");
             if (period_it != info_.hardware_parameters.end())
             {
@@ -135,32 +309,30 @@ namespace beckhoff_ads_hardware_interface
         }
         catch (const std::exception &ex)
         {
-            RCLCPP_WARN(getLogger(), "Invalid read_poll_period_ms: %s. Running unpaced.", ex.what());
-        }
-
-        // Configure ADS Client Device
-        if (!configure_ads_device())
-        {
-            RCLCPP_FATAL(getLogger(), "Failed to configure ADS device from URDF parameters.");
-            return hardware_interface::CallbackReturn::ERROR;
+            RCLCPP_WARN(getLogger(), "Invalid notify_timeout_ms/read_poll_period_ms: %s. Using defaults (disabled).", ex.what());
         }
 
         // Fill the ADSDataLayout vectors for read and write operations
         ads_read_layout_configure();
         ads_write_layout_configure();
 
-        // Request handles for all symbolic PLC variable names
+        // Request handles for symbolic PLC variable names. In notification mode the read
+        // symbols are resolved internally by AdsNotification, so explicit read handles are
+        // only needed when polling. Write handles are always required.
         RCLCPP_INFO(getLogger(), "Fetching ADS handles for configured PLC variables...");
-        for (auto &layout : ads_item_layouts_read_)
+        if (!read_via_notifications_)
         {
-            try
+            for (auto &layout : ads_item_layouts_read_)
             {
-                layout.ads_handle_owner.emplace(ads_device_->GetHandle(layout.plc_name_symbolic));
-                layout.ads_handle = **layout.ads_handle_owner;
-            }
-            catch (const std::exception &ex)
-            {
-                RCLCPP_ERROR(getLogger(), "\tADS Exception getting handle for '%s': %s. Read operations for this variable will fail.", layout.plc_name_symbolic.c_str(), ex.what());
+                try
+                {
+                    layout.ads_handle_owner.emplace(ads_device_->GetHandle(layout.plc_name_symbolic));
+                    layout.ads_handle = **layout.ads_handle_owner;
+                }
+                catch (const std::exception &ex)
+                {
+                    RCLCPP_ERROR(getLogger(), "\tADS Exception getting handle for '%s': %s. Read operations for this variable will fail.", layout.plc_name_symbolic.c_str(), ex.what());
+                }
             }
         }
         for (auto &layout : ads_item_layouts_write_)
@@ -177,11 +349,22 @@ namespace beckhoff_ads_hardware_interface
         }
         RCLCPP_INFO(getLogger(), "\tHandles acquired");
 
-        // Pre-pack what we can for SUM read/write commands
-        if (!build_sum_read_buffers())
+        // Pre-pack the read path: SUM-read buffers when polling, device notifications otherwise.
+        if (read_via_notifications_)
         {
-            RCLCPP_FATAL(getLogger(), "\tFailed to build ADS sum read buffer.");
-            return hardware_interface::CallbackReturn::ERROR;
+            if (!setup_notifications())
+            {
+                RCLCPP_FATAL(getLogger(), "\tFailed to register ADS device notifications.");
+                return hardware_interface::CallbackReturn::ERROR;
+            }
+        }
+        else
+        {
+            if (!build_sum_read_buffers())
+            {
+                RCLCPP_FATAL(getLogger(), "\tFailed to build ADS sum read buffer.");
+                return hardware_interface::CallbackReturn::ERROR;
+            }
         }
         if (!build_sum_write_buffers())
         {
@@ -337,6 +520,110 @@ namespace beckhoff_ads_hardware_interface
         return true;
     }
 
+    bool BeckhoffADSHardwareInterface::setup_notifications()
+    {
+        // Release any existing notifications and their slots before acquiring fresh ones.
+        teardown_notifications();
+
+        if (ads_item_layouts_read_.empty())
+        {
+            RCLCPP_INFO(getLogger(), "No items to configure for ADS notifications.");
+            return true;
+        }
+        RCLCPP_INFO(getLogger(), "Registering ADS device notifications for %zu read symbol(s)...",
+                    ads_item_layouts_read_.size());
+
+        read_notifications_.reserve(ads_item_layouts_read_.size());
+        notif_slot_indices_.reserve(ads_item_layouts_read_.size());
+
+        for (auto &layout : ads_item_layouts_read_)
+        {
+            const uint32_t sample_size =
+                static_cast<uint32_t>(layout.plc_element_byte_size * layout.num_elements);
+            const bool cyclic = (layout.notify_trans_mode == ADSTRANS_SERVERCYCLE);
+
+            // Reserve/reuse a registry slot. It is quiescent, so rewriting its fields is safe.
+            const uint32_t h_user = acquire_context_slot();
+            NotificationContext *ctx = context_at(h_user);
+            notif_slot_indices_.push_back(h_user);
+
+            ctx->plc_type = layout.plc_type;
+            ctx->elem_byte_size = layout.plc_element_byte_size;
+            ctx->expected_sample_size = sample_size;
+            ctx->last_update_steady_ns.store(0, std::memory_order_relaxed);
+            ctx->values.clear();
+            ctx->targets.clear();
+
+            // One cache slot per interface targeting this symbol. ros2_interfaces_ is keyed by
+            // the URDF array index (not a dense 0..n-1), so the sample offset must be derived
+            // from that index, mirroring how the SUM-read path computes read_buffer_offset_data.
+            for (const auto &[index, interface_name] : layout.ros2_interfaces_)
+            {
+                ctx->values.emplace_back(std::numeric_limits<double>::quiet_NaN());
+                std::atomic<double> *dest = &ctx->values.back();
+
+                ElementTarget target;
+                target.sample_byte_offset = index * layout.plc_element_byte_size;
+                target.dest = dest;
+                ctx->targets.push_back(target);
+
+                notif_read_targets_.push_back(
+                    NotifReadTarget{interface_name, dest, &ctx->last_update_steady_ns, cyclic});
+            }
+
+            // Publish the context BEFORE registering: the AdsNotification constructor can fire
+            // the callback immediately (e.g. the initial on-change sample) on another thread.
+            ctx->ready.store(true, std::memory_order_release);
+
+            AdsNotificationAttrib attrib{};
+            attrib.cbLength = sample_size;
+            attrib.nTransMode = layout.notify_trans_mode;
+            attrib.nMaxDelay = layout.notify_max_delay_100ns;
+            attrib.nCycleTime = layout.notify_cycle_100ns;
+
+            try
+            {
+                read_notifications_.emplace_back(*ads_device_, layout.plc_name_symbolic,
+                                                 attrib, &notification_callback, h_user);
+                RCLCPP_INFO(getLogger(), "\t%s [%s, cycle=%.1f ms, maxDelay=%.1f ms] -> %zu interface(s)",
+                            layout.plc_name_symbolic.c_str(),
+                            cyclic ? "cyclic" : "on-change",
+                            layout.notify_cycle_100ns / 10000.0,
+                            layout.notify_max_delay_100ns / 10000.0,
+                            layout.ros2_interfaces_.size());
+            }
+            catch (const std::exception &ex)
+            {
+                ctx->ready.store(false, std::memory_order_release);
+                RCLCPP_ERROR(getLogger(), "\tFailed to register notification for '%s': %s",
+                             layout.plc_name_symbolic.c_str(), ex.what());
+                read_notifications_.clear();
+                release_notification_slots();
+                notif_read_targets_.clear();
+                return false;
+            }
+        }
+        RCLCPP_INFO(getLogger(), "\tADS notifications registered.");
+        return true;
+    }
+
+    void BeckhoffADSHardwareInterface::teardown_notifications()
+    {
+        // Delete notifications first (needs ads_device_ alive, stops new callbacks), then drain slots.
+        read_notifications_.clear();
+        release_notification_slots();
+        notif_read_targets_.clear();
+    }
+
+    void BeckhoffADSHardwareInterface::release_notification_slots()
+    {
+        for (uint32_t index : notif_slot_indices_)
+        {
+            release_context_slot(index);
+        }
+        notif_slot_indices_.clear();
+    }
+
     void BeckhoffADSHardwareInterface::ads_read_layout_configure()
     {
         // Count all state interfaces to pre-allocate memory once and avoid reallocations.
@@ -358,6 +645,11 @@ namespace beckhoff_ads_hardware_interface
                 std::string plc_type_str;
                 size_t num_elements = 1;
                 size_t plc_index = 0;
+                // Notification tuning (read path only). Defaults: deliver each change as soon
+                // as the PLC detects it, checking at most every 10 ms.
+                std::string notify_mode_str = "onchange";
+                double notify_cycle_ms = 10.0;
+                double notify_max_delay_ms = 0.0;
                 try
                 {
                     plc_symbol = descr.interface_info.parameters.at("PLC_symbol");
@@ -369,6 +661,18 @@ namespace beckhoff_ads_hardware_interface
                     if (descr.interface_info.parameters.count("index"))
                     {
                         plc_index = std::stoul(descr.interface_info.parameters.at("index"));
+                    }
+                    if (descr.interface_info.parameters.count("notify_mode"))
+                    {
+                        notify_mode_str = descr.interface_info.parameters.at("notify_mode");
+                    }
+                    if (descr.interface_info.parameters.count("notify_cycle_ms"))
+                    {
+                        notify_cycle_ms = std::stod(descr.interface_info.parameters.at("notify_cycle_ms"));
+                    }
+                    if (descr.interface_info.parameters.count("notify_max_delay_ms"))
+                    {
+                        notify_max_delay_ms = std::stod(descr.interface_info.parameters.at("notify_max_delay_ms"));
                     }
                 }
                 catch (const std::exception &e)
@@ -386,6 +690,35 @@ namespace beckhoff_ads_hardware_interface
                     layout.num_elements = num_elements;
                     layout.plc_type = strToPlcType(plc_type_str);
                     layout.ros2_interfaces_.emplace(std::make_pair(plc_index, name));
+
+                    // Per-symbol notification config comes from the first interface that names
+                    // the symbol (one notification covers the whole symbol/array). ADS cycle and
+                    // max-delay fields are in 100 ns ticks, so convert from the URDF milliseconds.
+                    std::string notify_mode_upper = notify_mode_str;
+                    std::transform(notify_mode_upper.begin(), notify_mode_upper.end(),
+                                   notify_mode_upper.begin(), ::toupper);
+                    layout.notify_trans_mode =
+                        (notify_mode_upper == "CYCLIC" || notify_mode_upper == "CYCLE")
+                            ? ADSTRANS_SERVERCYCLE
+                            : ADSTRANS_SERVERONCHA;
+                    // ms -> 100 ns ticks, clamped so a bad value cannot wrap uint32_t.
+                    auto ms_to_ticks = [this, &name](double ms) -> uint32_t
+                    {
+                        const double ticks = ms * 10000.0;
+                        if (!std::isfinite(ticks) || ticks < 0.0 ||
+                            ticks > static_cast<double>(std::numeric_limits<uint32_t>::max()))
+                        {
+                            RCLCPP_WARN(getLogger(),
+                                        "notify timing for '%s' out of range (%.3f ms); clamping.",
+                                        name.c_str(), ms);
+                            return (std::isfinite(ticks) && ticks > 0.0)
+                                       ? std::numeric_limits<uint32_t>::max()
+                                       : 0u;
+                        }
+                        return static_cast<uint32_t>(ticks);
+                    };
+                    layout.notify_cycle_100ns = ms_to_ticks(notify_cycle_ms);
+                    layout.notify_max_delay_100ns = ms_to_ticks(notify_max_delay_ms);
 
                     if (layout.plc_type == PLCType::UNKNOWN || layout.plc_type == PLCType::STRING)
                     {
@@ -532,8 +865,39 @@ namespace beckhoff_ads_hardware_interface
     hardware_interface::return_type BeckhoffADSHardwareInterface::read(
         const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
     {
-        // The reader thread performs the SUM read off the control loop and decodes into
-        // polling_read_cache_. Here we only publish the latest cached values.
+        // Notification mode: publish the cached values, no network I/O here. A NaN slot means no
+        // sample yet (normal at startup), which is not an error. The only fault raised is a cyclic
+        // notification that stopped updating within notif_staleness_ns_; on-change symbols and
+        // not-yet-seen symbols stay exempt.
+        if (read_via_notifications_)
+        {
+            bool ok = true;
+            const long long now_ns = (notif_staleness_ns_ > 0) ? steady_now_ns() : 0;
+            for (const auto &target : notif_read_targets_)
+            {
+                set_state(target.state_interface_name, target.cache->load(std::memory_order_acquire));
+
+                if (target.cyclic && notif_staleness_ns_ > 0)
+                {
+                    const long long last = target.last_update_ns->load(std::memory_order_relaxed);
+                    if (last != 0 && (now_ns - last) > notif_staleness_ns_)
+                    {
+                        ok = false;
+                    }
+                }
+            }
+
+            if (!ok)
+            {
+                RCLCPP_WARN_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
+                                     "Notification read: a cyclic state interface has gone stale.");
+            }
+            return ok ? hardware_interface::return_type::OK
+                      : hardware_interface::return_type::ERROR;
+        }
+
+        // Polling mode: the reader thread performs the SUM read off the control loop and decodes
+        // into polling_read_cache_. Here we only publish the latest cached values.
         if (num_items_read_ == 0)
         {
             return hardware_interface::return_type::OK;
@@ -830,7 +1194,8 @@ namespace beckhoff_ads_hardware_interface
             write_thread_ = std::thread(&BeckhoffADSHardwareInterface::writer_loop, this);
         }
 
-        if (num_items_read_ > 0 && !read_thread_.joinable())
+        // Reader thread only needed in polling mode; notifications cache via the dispatcher.
+        if (!read_via_notifications_ && num_items_read_ > 0 && !read_thread_.joinable())
         {
             read_stop_.store(false, std::memory_order_release);
             read_thread_ = std::thread(&BeckhoffADSHardwareInterface::reader_loop, this);
@@ -863,8 +1228,11 @@ namespace beckhoff_ads_hardware_interface
         // Stop the worker threads before touching the device; both call through ads_device_.
         // Safe to call even if on_deactivate already joined them.
         stop_io_threads();
-        // Release symbol handles before the device: their deleters call DeleteSymbolHandle
-        // through ads_device_. Skipping this is what segfaulted on Ctrl-C.
+        // Delete notifications BEFORE the device: each AdsNotification's destructor calls
+        // DeleteNotification, which dereferences ads_device_. This also drains in-flight
+        // callbacks and returns the registry slots.
+        teardown_notifications();
+        // Release symbol handles before the device, same reason; this fixed the Ctrl-C segfault.
         release_ads_handles();
         if (ads_device_)
         {
