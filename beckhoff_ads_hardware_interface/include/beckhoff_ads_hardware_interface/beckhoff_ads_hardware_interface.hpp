@@ -132,6 +132,37 @@ namespace beckhoff_ads_hardware_interface
     rclcpp::Logger getLogger() { return rclcpp::get_logger("BeckhoffADSHardwareInterface"); }
     std::shared_ptr<rclcpp::Clock> logging_throttle_clock_;
 
+    /**
+     * @brief Decodes well-known ADS error codes into a short hint for log output
+     *
+     * @param error_code ADS return code from the AdsLib
+     * @returns Static text describing the code, or a generic fallback
+     */
+    static const char *adsErrorText(long error_code);
+
+    /**
+     * @brief Records a failed SUM-read round-trip for outage and recovery logs
+     *
+     * Stamps the outage start on the first failure and resets recovery tracking.
+     * Reader thread only.
+     */
+    void record_read_failure();
+
+    /**
+     * @brief Records a failed SUM-write round-trip for outage and recovery logs
+     *
+     * Stamps the outage start on the first failure and resets recovery tracking.
+     * Writer thread only.
+     */
+    void record_write_failure();
+
+    // Connection target details kept for error logs (populated in configure_ads_device).
+    std::string plc_ip_address_;
+    std::string plc_ams_net_id_str_;
+
+    // A link must stay good this long before an outage is declared over.
+    static constexpr std::chrono::seconds RECOVERY_STABLE_PERIOD{1};
+
     // ========= PLC ==============================
 
     // PLC Type and Size Helpers
@@ -198,6 +229,10 @@ namespace beckhoff_ads_hardware_interface
     bool write_pending_ = false;                 // a fresh buffer is waiting (guarded by write_mutex_)
     bool write_stop_ = false;                     // stop request (guarded by write_mutex_)
     std::atomic<bool> write_comms_ok_{true};      // last write transaction health, surfaced by write()
+    // Consecutive failed SUM-write round-trips, for outage and recovery logs. Writer thread only.
+    size_t write_consecutive_failures_ = 0;
+    std::chrono::steady_clock::time_point write_outage_start_;
+    std::optional<std::chrono::steady_clock::time_point> write_recovery_stable_since_;
 
     // Reader thread: owns the SUM-read round-trip. Decodes each sample into
     // polling_read_cache_; read() loads from it without blocking.
@@ -207,6 +242,10 @@ namespace beckhoff_ads_hardware_interface
     std::atomic<bool> read_comms_ok_{true};         // last read transaction health, surfaced by read()
     std::deque<std::atomic<double>> polling_read_cache_; // one slot per read instruction; deque keeps addresses stable
     long long read_poll_period_ns_ = 0;             // optional pacing between SUM reads; 0 = unpaced
+    // Consecutive failed SUM-read round-trips, for outage and recovery logs. Reader thread only.
+    size_t read_consecutive_failures_ = 0;
+    std::chrono::steady_clock::time_point read_outage_start_;
+    std::optional<std::chrono::steady_clock::time_point> read_recovery_stable_since_;
   };
 
 } // namespace beckhoff_ads_hardware_interface

@@ -549,6 +549,55 @@ namespace beckhoff_ads_hardware_interface
                    : hardware_interface::return_type::ERROR;
     }
 
+    const char *BeckhoffADSHardwareInterface::adsErrorText(long error_code)
+    {
+        const char *text = "unrecognised ADS error code";
+        switch (error_code)
+        {
+        case GLOBALERR_TARGET_PORT:
+            text = "target port not found; the PLC runtime is probably not running";
+            break;
+        case GLOBALERR_MISSING_ROUTE:
+            text = "target machine not found; no ADS route to the target";
+            break;
+        case ADSERR_DEVICE_SRVNOTSUPP:
+            text = "service is not supported by the server";
+            break;
+        case ADSERR_DEVICE_INVALIDACCESS:
+            text = "reading or writing this symbol is not permitted";
+            break;
+        case ADSERR_DEVICE_SYMBOLNOTFOUND:
+            text = "symbol not found on the PLC; the PLC program may have changed";
+            break;
+        case ADSERR_CLIENT_SYNCTIMEOUT:
+            text = "request timed out; no response from the PLC, check the network link and PLC state";
+            break;
+        default:
+            break;
+        }
+        return text;
+    }
+
+    void BeckhoffADSHardwareInterface::record_read_failure()
+    {
+        if (read_consecutive_failures_ == 0)
+        {
+            read_outage_start_ = std::chrono::steady_clock::now();
+        }
+        ++read_consecutive_failures_;
+        read_recovery_stable_since_.reset();
+    }
+
+    void BeckhoffADSHardwareInterface::record_write_failure()
+    {
+        if (write_consecutive_failures_ == 0)
+        {
+            write_outage_start_ = std::chrono::steady_clock::now();
+        }
+        ++write_consecutive_failures_;
+        write_recovery_stable_since_.reset();
+    }
+
     void BeckhoffADSHardwareInterface::reader_loop()
     {
         // Back off after a failure so a broken link does not spin at full CPU.
@@ -576,8 +625,20 @@ namespace beckhoff_ads_hardware_interface
 
             if (ads_sum_read_error != ADSERR_NOERR)
             {
-                RCLCPP_ERROR_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
-                                      "Overall ADS Sum Read Error: 0x%lX.", ads_sum_read_error);
+                if (read_consecutive_failures_ == 0)
+                {
+                    RCLCPP_ERROR(getLogger(),
+                                 "ADS Sum Read failed: 0x%lX (%s). Target %s, AMS NetId %s.",
+                                 ads_sum_read_error, adsErrorText(ads_sum_read_error),
+                                 plc_ip_address_.c_str(), plc_ams_net_id_str_.c_str());
+                }
+                else
+                {
+                    RCLCPP_ERROR_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
+                                          "ADS Sum Read still failing: 0x%lX (%s).",
+                                          ads_sum_read_error, adsErrorText(ads_sum_read_error));
+                }
+                record_read_failure();
                 read_comms_ok_.store(false, std::memory_order_release);
                 std::this_thread::sleep_for(ERROR_BACKOFF);
                 continue;
@@ -588,9 +649,32 @@ namespace beckhoff_ads_hardware_interface
                 RCLCPP_ERROR_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
                                       "ADS Sum Read size mismatch. Expected %zu, Got %u.",
                                       ads_buffer_sum_read_response_.size(), bytes_read_from_plc);
+                record_read_failure();
                 read_comms_ok_.store(false, std::memory_order_release);
                 std::this_thread::sleep_for(ERROR_BACKOFF);
                 continue;
+            }
+
+            // Declare recovery only after the link has been good for a stable period, so a
+            // flapping link logs one outage instead of an error/recovery pair per cycle.
+            if (read_consecutive_failures_ > 0)
+            {
+                const std::chrono::steady_clock::time_point now_steady = std::chrono::steady_clock::now();
+                if (!read_recovery_stable_since_)
+                {
+                    read_recovery_stable_since_ = now_steady;
+                }
+                else if (now_steady - *read_recovery_stable_since_ >= RECOVERY_STABLE_PERIOD)
+                {
+                    const int64_t outage_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                  *read_recovery_stable_since_ - read_outage_start_)
+                                                  .count();
+                    RCLCPP_INFO(getLogger(),
+                                "ADS Sum Read recovered after %zu failed cycles (%.1f s).",
+                                read_consecutive_failures_, static_cast<double>(outage_ms) / 1000.0);
+                    read_consecutive_failures_ = 0;
+                    read_recovery_stable_since_.reset();
+                }
             }
 
             bool any_item_read_failed = false;
@@ -605,8 +689,9 @@ namespace beckhoff_ads_hardware_interface
                 if (item_error_code != ADSERR_NOERR)
                 {
                     RCLCPP_WARN_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
-                                         "ADS Sum Read operation corresponding to the state interface '%s' failed: 0x%X.",
-                                         read_instruction.state_interface_name.c_str(), item_error_code);
+                                         "ADS Sum Read operation corresponding to the state interface '%s' failed: 0x%X (%s).",
+                                         read_instruction.state_interface_name.c_str(), item_error_code,
+                                         adsErrorText(static_cast<long>(item_error_code)));
                     any_item_read_failed = true;
                     continue;
                 }
@@ -678,6 +763,13 @@ namespace beckhoff_ads_hardware_interface
             {
                 // bool is size of byte in PLC
                 uint8_t plc_val = (val != 0.0) ? 1 : 0;
+                uint8_t previous_val;
+                memcpy(&previous_val, ptr_write_buffer_destination_current, sizeof(uint8_t));
+                if (previous_val != plc_val)
+                {
+                    RCLCPP_DEBUG(getLogger(), "Write command '%s': %u -> %u",
+                                 write_instruction.command_interface_name.c_str(), previous_val, plc_val);
+                }
                 memcpy(ptr_write_buffer_destination_current, &plc_val, plcTypeByteSize(write_instruction.plc_type));
                 break;
             }
@@ -783,8 +875,20 @@ namespace beckhoff_ads_hardware_interface
 
             if (ads_sum_write_error != ADSERR_NOERR)
             {
-                RCLCPP_ERROR_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
-                                      "Overall ADS Sum Write Error: 0x%lX.", ads_sum_write_error);
+                if (write_consecutive_failures_ == 0)
+                {
+                    RCLCPP_ERROR(getLogger(),
+                                 "ADS Sum Write failed: 0x%lX (%s). Target %s, AMS NetId %s.",
+                                 ads_sum_write_error, adsErrorText(ads_sum_write_error),
+                                 plc_ip_address_.c_str(), plc_ams_net_id_str_.c_str());
+                }
+                else
+                {
+                    RCLCPP_ERROR_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
+                                          "ADS Sum Write still failing: 0x%lX (%s).",
+                                          ads_sum_write_error, adsErrorText(ads_sum_write_error));
+                }
+                record_write_failure();
                 write_comms_ok_.store(false, std::memory_order_release);
                 continue;
             }
@@ -794,6 +898,31 @@ namespace beckhoff_ads_hardware_interface
                 RCLCPP_ERROR_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
                                       "ADS Sum Write response size mismatch (error codes). Expected %zu, Got %u.",
                                       ads_buffer_sum_write_response_.size(), bytes_response_buffer_from_plc);
+                record_write_failure();
+                write_comms_ok_.store(false, std::memory_order_release);
+                continue;
+            }
+
+            // Declare recovery only after the link has been good for a stable period, so a
+            // flapping link logs one outage instead of an error/recovery pair per round-trip.
+            if (write_consecutive_failures_ > 0)
+            {
+                const std::chrono::steady_clock::time_point now_steady = std::chrono::steady_clock::now();
+                if (!write_recovery_stable_since_)
+                {
+                    write_recovery_stable_since_ = now_steady;
+                }
+                else if (now_steady - *write_recovery_stable_since_ >= RECOVERY_STABLE_PERIOD)
+                {
+                    const int64_t outage_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                  *write_recovery_stable_since_ - write_outage_start_)
+                                                  .count();
+                    RCLCPP_INFO(getLogger(),
+                                "ADS Sum Write recovered after %zu failed round-trips (%.1f s).",
+                                write_consecutive_failures_, static_cast<double>(outage_ms) / 1000.0);
+                    write_consecutive_failures_ = 0;
+                    write_recovery_stable_since_.reset();
+                }
             }
 
             // One error code per write item, in request order: index i maps to layout i.
@@ -805,8 +934,9 @@ namespace beckhoff_ads_hardware_interface
                 if (item_error_code != ADSERR_NOERR)
                 {
                     RCLCPP_WARN_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
-                                         "ADS Sum Write sub-op for '%s' (handle 0x%X) failed: 0x%X",
-                                         ads_item_layouts_write_[i].plc_name_symbolic.c_str(), ads_item_layouts_write_[i].ads_handle, item_error_code);
+                                         "ADS Sum Write sub-op for '%s' (handle 0x%X) failed: 0x%X (%s)",
+                                         ads_item_layouts_write_[i].plc_name_symbolic.c_str(), ads_item_layouts_write_[i].ads_handle, item_error_code,
+                                         adsErrorText(static_cast<long>(item_error_code)));
                     any_item_write_failed = true;
                 }
             }
@@ -819,6 +949,10 @@ namespace beckhoff_ads_hardware_interface
         // Clear any stale fault before (re)starting.
         write_comms_ok_.store(true, std::memory_order_release);
         read_comms_ok_.store(true, std::memory_order_release);
+        read_consecutive_failures_ = 0;
+        write_consecutive_failures_ = 0;
+        read_recovery_stable_since_.reset();
+        write_recovery_stable_since_.reset();
 
         if (num_items_write_ > 0 && !write_thread_.joinable())
         {
@@ -899,6 +1033,8 @@ namespace beckhoff_ads_hardware_interface
             std::string plc_ams_net_id_str = params.at("plc_ams_net_id");
             std::string local_ams_net_id_str = params.at("local_ams_net_id");
             uint16_t plc_ams_port = std::stoul(params.at("plc_ams_port"));
+            plc_ip_address_ = plc_ip;
+            plc_ams_net_id_str_ = plc_ams_net_id_str;
 
             AmsNetId remote_net_id;
             if (sscanf(plc_ams_net_id_str.c_str(), "%hhu.%hhu.%hhu.%hhu.%hhu.%hhu",
@@ -936,7 +1072,10 @@ namespace beckhoff_ads_hardware_interface
         }
         catch (const AdsException &ex)
         {
-            RCLCPP_FATAL(getLogger(), "\tADS Exception during connection: %s (Error Code: 0x%lX)", ex.what(), ex.errorCode);
+            RCLCPP_FATAL(getLogger(),
+                         "\tADS Exception during connection to %s (AMS NetId %s): %s (error 0x%lX: %s)",
+                         plc_ip_address_.c_str(), plc_ams_net_id_str_.c_str(),
+                         ex.what(), static_cast<long>(ex.errorCode), adsErrorText(static_cast<long>(ex.errorCode)));
             return false;
         }
         catch (const std::exception &ex)
