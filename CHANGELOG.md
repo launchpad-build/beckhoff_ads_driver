@@ -2,6 +2,13 @@
 
 <!-- towncrier release notes start -->
 
+## 1.4.0 (2026-07-06)
+
+### Features
+
+- ADS sum read and write failures now log the decoded error meaning. The first failure of an outage names the target PLC address, and a recovery line reports the outage duration once the link is stable again. Boolean command value changes are logged at debug level at the write boundary. (ads-error-context)
+
+
 ## 1.3.0 (2026-07-01)
 
 ### Features
