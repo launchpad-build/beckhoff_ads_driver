@@ -628,9 +628,9 @@ namespace beckhoff_ads_hardware_interface
                 if (read_consecutive_failures_ == 0)
                 {
                     RCLCPP_ERROR(getLogger(),
-                                 "ADS Sum Read failed: 0x%lX (%s). Target %s, AMS NetId %s.",
+                                 "ADS Sum Read failed: 0x%lX (%s). Target %s, AMS NetId %s, port %u.",
                                  ads_sum_read_error, adsErrorText(ads_sum_read_error),
-                                 plc_ip_address_.c_str(), plc_ams_net_id_str_.c_str());
+                                 plc_ip_address_.c_str(), plc_ams_net_id_str_.c_str(), plc_ams_port_);
                 }
                 else
                 {
@@ -878,9 +878,9 @@ namespace beckhoff_ads_hardware_interface
                 if (write_consecutive_failures_ == 0)
                 {
                     RCLCPP_ERROR(getLogger(),
-                                 "ADS Sum Write failed: 0x%lX (%s). Target %s, AMS NetId %s.",
+                                 "ADS Sum Write failed: 0x%lX (%s). Target %s, AMS NetId %s, port %u.",
                                  ads_sum_write_error, adsErrorText(ads_sum_write_error),
-                                 plc_ip_address_.c_str(), plc_ams_net_id_str_.c_str());
+                                 plc_ip_address_.c_str(), plc_ams_net_id_str_.c_str(), plc_ams_port_);
                 }
                 else
                 {
@@ -1035,6 +1035,7 @@ namespace beckhoff_ads_hardware_interface
             uint16_t plc_ams_port = std::stoul(params.at("plc_ams_port"));
             plc_ip_address_ = plc_ip;
             plc_ams_net_id_str_ = plc_ams_net_id_str;
+            plc_ams_port_ = plc_ams_port;
 
             AmsNetId remote_net_id;
             if (sscanf(plc_ams_net_id_str.c_str(), "%hhu.%hhu.%hhu.%hhu.%hhu.%hhu",
