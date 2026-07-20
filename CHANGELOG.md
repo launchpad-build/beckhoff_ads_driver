@@ -2,6 +2,13 @@
 
 <!-- towncrier release notes start -->
 
+## 1.4.1 (2026-07-20)
+
+### Fixes
+
+- Include the AMS port in the ADS read and write comms-drop error logs, so a target-port-not-found outage names the port it could not reach. (ads-comms-drop-log-port)
+
+
 ## 1.4.0 (2026-07-06)
 
 ### Features
