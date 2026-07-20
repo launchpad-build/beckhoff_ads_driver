@@ -159,6 +159,7 @@ namespace beckhoff_ads_hardware_interface
     // Connection target details kept for error logs (populated in configure_ads_device).
     std::string plc_ip_address_;
     std::string plc_ams_net_id_str_;
+    uint16_t plc_ams_port_{0};
 
     // A link must stay good this long before an outage is declared over.
     static constexpr std::chrono::seconds RECOVERY_STABLE_PERIOD{1};
