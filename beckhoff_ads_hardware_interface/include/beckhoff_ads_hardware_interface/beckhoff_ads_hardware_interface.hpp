@@ -113,6 +113,7 @@ namespace beckhoff_ads_hardware_interface
     std::string command_interface_name;
     std::string fallback_state_interface_name; // The state interface name corresponding to the current command interface name
     CommandFallback fallback = CommandFallback::HOLD_LAST;
+    bool is_heartbeat = false; // value comes from the interface's own counter, not a controller
   };
 
   class BeckhoffADSHardwareInterface : public hardware_interface::SystemInterface
@@ -176,6 +177,13 @@ namespace beckhoff_ads_hardware_interface
      * Writer thread only.
      */
     void record_write_failure();
+
+    // Synthetic interface name for the link heartbeat. Never exported to ros2_control; it
+    // only tags the write instruction whose value the interface generates itself.
+    static constexpr const char *HEARTBEAT_INTERFACE_NAME = "__ads_link_heartbeat";
+
+    std::string heartbeat_symbol_;        // PLC symbol to beat on; empty disables the heartbeat
+    uint32_t heartbeat_counter_{0};       // advanced in write(), so control-loop thread only
 
     // Connection target details kept for error logs (populated in configure_ads_device).
     std::string plc_ip_address_;
