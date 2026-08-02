@@ -177,6 +177,32 @@ namespace beckhoff_ads_hardware_interface
         }
         RCLCPP_INFO(getLogger(), "\tHandles acquired");
 
+        // Link command interfaces to their corresponding state interfaces. This has to run
+        // before the write buffers are built: build_sum_write_buffers resolves each
+        // interface's fallback out of this map, and while the linking came afterwards the
+        // map was always empty, so no interface has ever had a mirror-state fallback.
+        RCLCPP_INFO(getLogger(), "Linking command interfaces to state interfaces...");
+        for (auto &command_layout : ads_item_layouts_write_)
+        {
+            for (const auto &state_layout : ads_item_layouts_read_)
+            {
+                if (command_layout.plc_name_symbolic == state_layout.plc_name_symbolic)
+                {
+                    for (size_t k = 0; k < command_layout.num_elements; ++k)
+                    {
+                        const auto command_it = command_layout.ros2_interfaces_.find(k);
+                        const auto state_it = state_layout.ros2_interfaces_.find(k);
+                        if (command_it == command_layout.ros2_interfaces_.end() ||
+                            state_it == state_layout.ros2_interfaces_.end())
+                        {
+                            continue; // sparse array indices: this element has no matching pair
+                        }
+                        command_layout.state_command_interfaces_map_.emplace(command_it->second, state_it->second);
+                    }
+                }
+            }
+        }
+
         // Pre-pack what we can for SUM read/write commands
         if (!build_sum_read_buffers())
         {
@@ -187,24 +213,6 @@ namespace beckhoff_ads_hardware_interface
         {
             RCLCPP_FATAL(getLogger(), "\tFailed to build ADS sum write buffer.");
             return hardware_interface::CallbackReturn::ERROR;
-        }
-
-        // Link command interfaces to their corresponding state interfaces
-        RCLCPP_INFO(getLogger(), "Linking command interfaces to state interfaces...");
-        for (auto &command_layout : ads_item_layouts_write_)
-        {
-            for (const auto &state_layout : ads_item_layouts_read_)
-            {
-                if (command_layout.plc_name_symbolic == state_layout.plc_name_symbolic)
-                {
-                    for (size_t k = 0; k < command_layout.num_elements; ++k)
-                    {
-                        // The pair is made of (command_interface_name, corresponding_state_interface_name)
-                        auto pair = std::make_pair(command_layout.ros2_interfaces_.find(k)->second, state_layout.ros2_interfaces_.find(k)->second);
-                        command_layout.state_command_interfaces_map_.emplace(pair);
-                    }
-                }
-            }
         }
 
         return CallbackReturn::SUCCESS;
@@ -318,10 +326,32 @@ namespace beckhoff_ads_hardware_interface
                 write_instruction.command_interface_name = interface_name;
                 write_instruction.fallback_state_interface_name = "";
 
-                // There exists a state interface for the same PLC symbol
-                if (!layout.state_command_interfaces_map_.empty())
+                // What to send when a controller stops writing this interface. Holding the
+                // last value is what every stack has actually had, so it stays the default.
+                // Mirroring the state interface is opt-in, because for a position command it
+                // turns "no command" into "stay put", which reads as a slow trajectory rather
+                // than as a stall. Zero is for velocity commands, where holding the last value
+                // means a dead controller keeps a feed-forward alive.
+                const auto policy_it = layout.fallback_policies_.find(interface_name);
+                write_instruction.fallback = (policy_it != layout.fallback_policies_.end())
+                                                 ? policy_it->second
+                                                 : CommandFallback::HOLD_LAST;
+
+                if (write_instruction.fallback == CommandFallback::MIRROR_STATE)
                 {
-                    write_instruction.fallback_state_interface_name = layout.state_command_interfaces_map_.find(interface_name)->second;
+                    const auto state_it = layout.state_command_interfaces_map_.find(interface_name);
+                    if (state_it != layout.state_command_interfaces_map_.end())
+                    {
+                        write_instruction.fallback_state_interface_name = state_it->second;
+                    }
+                    else
+                    {
+                        RCLCPP_WARN(getLogger(),
+                                    "Command interface '%s' asks for a mirror_state fallback but no state interface "
+                                    "shares its PLC symbol. Holding the last value instead.",
+                                    interface_name.c_str());
+                        write_instruction.fallback = CommandFallback::HOLD_LAST;
+                    }
                 }
 
                 // The command interfaces' names are ordered by ascending indexes of the PLC array thanks to layout.ros2_interfaces_ being a map
@@ -477,6 +507,13 @@ namespace beckhoff_ads_hardware_interface
                     continue;
                 }
 
+                std::string fallback_str;
+                if (descr.interface_info.parameters.count("command_fallback"))
+                {
+                    fallback_str = descr.interface_info.parameters.at("command_fallback");
+                }
+                const CommandFallback fallback_policy = parseCommandFallback(fallback_str, name);
+
                 if (processed_plc_symbols.find(plc_symbol) == processed_plc_symbols.end())
                 {
                     ADSDataLayout layout;
@@ -484,6 +521,7 @@ namespace beckhoff_ads_hardware_interface
                     layout.num_elements = num_elements;
                     layout.plc_type = strToPlcType(plc_type_str);
                     layout.ros2_interfaces_.emplace(std::make_pair(plc_index, name));
+                    layout.fallback_policies_.emplace(name, fallback_policy);
 
                     if (layout.plc_type == PLCType::UNKNOWN || layout.plc_type == PLCType::STRING)
                     {
@@ -506,6 +544,7 @@ namespace beckhoff_ads_hardware_interface
 
                     // Add the command interface name the layout
                     (*it).ros2_interfaces_.emplace(std::make_pair(plc_index, name));
+                    (*it).fallback_policies_.emplace(name, fallback_policy);
                 }
             }
         };
@@ -576,6 +615,30 @@ namespace beckhoff_ads_hardware_interface
             break;
         }
         return text;
+    }
+
+    CommandFallback BeckhoffADSHardwareInterface::parseCommandFallback(
+        const std::string &policy_str, const std::string &interface_name)
+    {
+        CommandFallback result = CommandFallback::HOLD_LAST;
+
+        if (policy_str == "mirror_state")
+        {
+            result = CommandFallback::MIRROR_STATE;
+        }
+        else if (policy_str == "zero")
+        {
+            result = CommandFallback::ZERO;
+        }
+        else if (!policy_str.empty() && policy_str != "hold_last")
+        {
+            RCLCPP_WARN(getLogger(),
+                        "Unknown command_fallback '%s' on interface '%s'. Expected hold_last, mirror_state or zero. "
+                        "Holding the last value.",
+                        policy_str.c_str(), interface_name.c_str());
+        }
+
+        return result;
     }
 
     void BeckhoffADSHardwareInterface::record_read_failure()
@@ -731,14 +794,22 @@ namespace beckhoff_ads_hardware_interface
 
             if (std::isnan(val))
             {
-                // if the original value was NaN and there exist a state interface of the same name, write corresponding state interface
-                if (!write_instruction.fallback_state_interface_name.empty())
+                // No controller wrote this interface on this cycle. Apply its fallback and
+                // count it, so a stall is distinguishable from a slow trajectory in the logs.
+                fallback_activations_.fetch_add(1, std::memory_order_relaxed);
+
+                if (write_instruction.fallback == CommandFallback::ZERO)
+                {
+                    val = 0.0;
+                }
+                else if (write_instruction.fallback == CommandFallback::MIRROR_STATE &&
+                         !write_instruction.fallback_state_interface_name.empty())
                 {
                     val = get_state(write_instruction.fallback_state_interface_name);
                 }
 
-                // if we STILL don't have a fallback value on, don't update the write buffer.
-                // the last valid command is written
+                // Hold the last value: leave this field of the buffer alone, which keeps
+                // whatever was packed on the most recent cycle that did carry a command.
                 if (std::isnan(val))
                 {
                     continue;
