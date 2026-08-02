@@ -88,6 +88,11 @@ namespace beckhoff_ads_hardware_interface
 
     // Per-interface command_fallback, parsed from the interface parameters.
     std::map<std::string, CommandFallback> fallback_policies_;
+
+    // True when every interface on this symbol declared optional="true". An optional symbol
+    // the PLC does not have is dropped with a warning; a required one fails configure.
+    bool optional = false;
+    bool handle_resolved = false;
   };
 
   // Packed header for sum read/write request item headers
