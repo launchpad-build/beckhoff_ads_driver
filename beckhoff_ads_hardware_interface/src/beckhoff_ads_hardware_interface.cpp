@@ -629,6 +629,7 @@ namespace beckhoff_ads_hardware_interface
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_activate(
         const rclcpp_lifecycle::State & /*previous_state*/)
     {
+        register_transaction_statistics();
         start_io_threads();
         return CallbackReturn::SUCCESS;
     }
@@ -714,8 +715,35 @@ namespace beckhoff_ads_hardware_interface
         return result;
     }
 
+    void BeckhoffADSHardwareInterface::refresh_transaction_statistics()
+    {
+        stat_read_rtt_ms_ = static_cast<double>(read_rtt_ns_.load(std::memory_order_relaxed)) * 1e-6;
+        stat_write_rtt_ms_ = static_cast<double>(write_rtt_ns_.load(std::memory_order_relaxed)) * 1e-6;
+        stat_read_transactions_ = static_cast<double>(read_transactions_total_.load(std::memory_order_relaxed));
+        stat_write_transactions_ = static_cast<double>(write_transactions_total_.load(std::memory_order_relaxed));
+        stat_write_coalesced_ = static_cast<double>(write_coalesced_total_.load(std::memory_order_relaxed));
+        stat_read_failures_ = static_cast<double>(read_failures_total_.load(std::memory_order_relaxed));
+        stat_write_failures_ = static_cast<double>(write_failures_total_.load(std::memory_order_relaxed));
+        stat_fallback_activations_ = static_cast<double>(fallback_activations_.load(std::memory_order_relaxed));
+        stat_heartbeat_ = static_cast<double>(heartbeat_counter_);
+    }
+
+    void BeckhoffADSHardwareInterface::register_transaction_statistics()
+    {
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_read_rtt_ms", &stat_read_rtt_ms_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_write_rtt_ms", &stat_write_rtt_ms_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_read_transactions", &stat_read_transactions_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_write_transactions", &stat_write_transactions_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_write_coalesced", &stat_write_coalesced_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_read_failures", &stat_read_failures_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_write_failures", &stat_write_failures_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_fallback_activations", &stat_fallback_activations_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_heartbeat", &stat_heartbeat_);
+    }
+
     void BeckhoffADSHardwareInterface::record_read_failure()
     {
+        read_failures_total_.fetch_add(1, std::memory_order_relaxed);
         if (read_consecutive_failures_ == 0)
         {
             read_outage_start_ = std::chrono::steady_clock::now();
@@ -726,6 +754,7 @@ namespace beckhoff_ads_hardware_interface
 
     void BeckhoffADSHardwareInterface::record_write_failure()
     {
+        write_failures_total_.fetch_add(1, std::memory_order_relaxed);
         if (write_consecutive_failures_ == 0)
         {
             write_outage_start_ = std::chrono::steady_clock::now();
@@ -745,8 +774,21 @@ namespace beckhoff_ads_hardware_interface
 
             // Only the reader touches the read response buffer, so decode happens outside the
             // lock; the lock only guards the shared single-port round-trip against the writer.
+            // Let a waiting setpoint go first. Both threads share one AMS port, and a read
+            // started now holds it for a whole round trip, which at a 2 ms control period is
+            // most of the budget. Reads tolerate being a cycle late; setpoints do not.
+            {
+                std::unique_lock<std::mutex> write_lock(write_mutex_);
+                if (write_pending_)
+                {
+                    write_lock.unlock();
+                    std::this_thread::yield();
+                }
+            }
+
             uint32_t bytes_read_from_plc = 0;
             long ads_sum_read_error;
+            const auto read_rtt_start = std::chrono::steady_clock::now();
             {
                 std::lock_guard<std::mutex> io_lock(ads_io_mutex_);
                 ads_sum_read_error = ads_device_->ReadWriteReqEx2(
@@ -758,6 +800,12 @@ namespace beckhoff_ads_hardware_interface
                     ads_buffer_sum_read_request_.data(),
                     &bytes_read_from_plc);
             }
+            read_rtt_ns_.store(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - read_rtt_start)
+                    .count(),
+                std::memory_order_relaxed);
+            read_transactions_total_.fetch_add(1, std::memory_order_relaxed);
 
             if (ads_sum_read_error != ADSERR_NOERR)
             {
@@ -976,11 +1024,20 @@ namespace beckhoff_ads_hardware_interface
             }
         }
 
+        refresh_transaction_statistics();
+
         // Hand the freshly packed request to the writer thread and return immediately. A newer
         // buffer overwrites one not yet sent, so the writer never backlogs (only the latest
         // setpoints matter).
         {
             std::lock_guard<std::mutex> lock(write_mutex_);
+            if (write_pending_)
+            {
+                // The previous buffer never made it onto the wire. That is the intended
+                // policy, since only the newest setpoints matter, but the rate at which it
+                // happens is how you tell whether the link is keeping up with the control loop.
+                write_coalesced_total_.fetch_add(1, std::memory_order_relaxed);
+            }
             write_pending_request_ = ads_buffer_sum_write_request_;
             write_pending_ = true;
         }
@@ -1015,6 +1072,7 @@ namespace beckhoff_ads_hardware_interface
             // the writer take the port, so it is not starved by the continuous reader.
             uint32_t bytes_response_buffer_from_plc = 0;
             long ads_sum_write_error;
+            const auto write_rtt_start = std::chrono::steady_clock::now();
             {
                 std::lock_guard<std::mutex> io_lock(ads_io_mutex_);
                 ads_sum_write_error = ads_device_->ReadWriteReqEx2(
@@ -1026,6 +1084,12 @@ namespace beckhoff_ads_hardware_interface
                     send_buffer.data(),
                     &bytes_response_buffer_from_plc);
             }
+            write_rtt_ns_.store(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - write_rtt_start)
+                    .count(),
+                std::memory_order_relaxed);
+            write_transactions_total_.fetch_add(1, std::memory_order_relaxed);
 
             if (ads_sum_write_error != ADSERR_NOERR)
             {

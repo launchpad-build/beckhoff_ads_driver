@@ -23,6 +23,7 @@
 #include <vector>
 #include <limits>
 
+#include "hardware_interface/introspection.hpp"
 #include "hardware_interface/system_interface.hpp"
 #include "hardware_interface/handle.hpp"
 #include "hardware_interface/hardware_info.hpp"
@@ -236,8 +237,45 @@ namespace beckhoff_ads_hardware_interface
     std::vector<uint8_t> ads_buffer_sum_write_response_;
     size_t num_items_write_ = 0;
 
+    /**
+     * @brief Copies the I/O threads' counters into the introspected mirrors
+     *
+     * pal_statistics reads plain doubles by address from the publisher thread, so the
+     * atomics the I/O threads own are mirrored here, on the control loop, rather than
+     * registered directly.
+     */
+    void refresh_transaction_statistics();
+
+    /**
+     * @brief Registers the ADS transaction statistics with the ros2_control introspection
+     */
+    void register_transaction_statistics();
+
+    // ===== ADS transaction statistics ==========================================
+    // Written by the I/O threads, mirrored onto the control loop and published through
+    // the controller manager's introspection topic, so a bag holds the link's behaviour
+    // alongside the trajectory it was carrying.
+    std::atomic<long long> read_rtt_ns_{0};
+    std::atomic<long long> write_rtt_ns_{0};
+    std::atomic<uint64_t> read_transactions_total_{0};
+    std::atomic<uint64_t> write_transactions_total_{0};
+    std::atomic<uint64_t> write_coalesced_total_{0};
+    std::atomic<uint64_t> read_failures_total_{0};
+    std::atomic<uint64_t> write_failures_total_{0};
+
     // Cycles on which a command interface carried no command and its fallback applied.
     std::atomic<uint64_t> fallback_activations_{0};
+
+    // Introspected mirrors. Only the control loop writes these.
+    double stat_read_rtt_ms_{0.0};
+    double stat_write_rtt_ms_{0.0};
+    double stat_read_transactions_{0.0};
+    double stat_write_transactions_{0.0};
+    double stat_write_coalesced_{0.0};
+    double stat_read_failures_{0.0};
+    double stat_write_failures_{0.0};
+    double stat_fallback_activations_{0.0};
+    double stat_heartbeat_{0.0};
 
     std::vector<ReadInstruction> ads_read_instructions_;
     std::vector<WriteInstruction> ads_write_instructions_;
