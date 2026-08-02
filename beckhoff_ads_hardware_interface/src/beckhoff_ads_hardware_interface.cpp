@@ -138,6 +138,17 @@ namespace beckhoff_ads_hardware_interface
             RCLCPP_WARN(getLogger(), "Invalid read_poll_period_ms: %s. Running unpaced.", ex.what());
         }
 
+        // Optional link heartbeat. The PLC watches this counter for movement, so it can tell
+        // a live control stack from one that died mid-move. Absent = disabled, which is what
+        // every stack that has not asked for it gets.
+        heartbeat_symbol_.clear();
+        auto heartbeat_it = info_.hardware_parameters.find("heartbeat_plc_symbol");
+        if (heartbeat_it != info_.hardware_parameters.end() && !heartbeat_it->second.empty())
+        {
+            heartbeat_symbol_ = heartbeat_it->second;
+            RCLCPP_INFO(getLogger(), "ADS link heartbeat enabled on PLC symbol '%s'.", heartbeat_symbol_.c_str());
+        }
+
         // Configure ADS Client Device
         if (!configure_ads_device())
         {
@@ -325,6 +336,7 @@ namespace beckhoff_ads_hardware_interface
                 write_instruction.plc_type = layout.plc_type;
                 write_instruction.command_interface_name = interface_name;
                 write_instruction.fallback_state_interface_name = "";
+                write_instruction.is_heartbeat = (interface_name == HEARTBEAT_INTERFACE_NAME);
 
                 // What to send when a controller stops writing this interface. Holding the
                 // last value is what every stack has actually had, so it stays the default.
@@ -551,6 +563,21 @@ namespace beckhoff_ads_hardware_interface
 
         init_ads_write_layout(joint_command_interfaces_);
         init_ads_write_layout(gpio_command_interfaces_);
+
+        // The heartbeat is the interface's own liveness signal, not a controller's. Owning it
+        // here is what makes it useful: it keeps advancing with no controller claiming
+        // anything, and it stops if the controller manager stalls or the writer thread wedges,
+        // both of which a controller-written counter would sail straight through.
+        if (!heartbeat_symbol_.empty())
+        {
+            ADSDataLayout layout;
+            layout.plc_name_symbolic = heartbeat_symbol_;
+            layout.num_elements = 1;
+            layout.plc_type = PLCType::UDINT;
+            layout.plc_element_byte_size = plcTypeByteSize(PLCType::UDINT);
+            layout.ros2_interfaces_.emplace(0, HEARTBEAT_INTERFACE_NAME);
+            ads_item_layouts_write_.push_back(std::move(layout));
+        }
     }
 
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_activate(
@@ -785,6 +812,16 @@ namespace beckhoff_ads_hardware_interface
         for (const auto &write_instruction : ads_write_instructions_)
         {
             uint8_t *ptr_write_buffer_destination_current = ads_buffer_sum_write_request_.data() + write_instruction.write_buffer_offset_data;
+
+            if (write_instruction.is_heartbeat)
+            {
+                // Wrapping is fine and eventually certain: the PLC watches for the value
+                // changing, never for it incrementing by one, because the writer coalesces
+                // and the counter routinely jumps.
+                const uint32_t beat = ++heartbeat_counter_;
+                memcpy(ptr_write_buffer_destination_current, &beat, sizeof(beat));
+                continue;
+            }
 
             // TODO: performance - Hoist the switch/case above for loop?
 
