@@ -52,6 +52,14 @@ namespace beckhoff_ads_hardware_interface
     STRING,
   };
 
+  // What to send for a command interface on a cycle where no controller wrote one.
+  enum class CommandFallback
+  {
+    HOLD_LAST,    // keep whatever was packed on the last cycle that carried a command
+    MIRROR_STATE, // send the state interface sharing this PLC symbol, so the target tracks reality
+    ZERO,         // send zero; the right answer for a velocity or effort command
+  };
+
   // Describes each PLC item (array or single variable) for polling via sum commands.
   struct ADSDataLayout
   {
@@ -77,6 +85,9 @@ namespace beckhoff_ads_hardware_interface
 
     // For interfaces targeting the same PLC symbol, store all their names with their corresponding index inside a map. This will be useful when calling thr ROS2 set_state and set_command functions.
     std::map<size_t, std::string> ros2_interfaces_;
+
+    // Per-interface command_fallback, parsed from the interface parameters.
+    std::map<std::string, CommandFallback> fallback_policies_;
   };
 
   // Packed header for sum read/write request item headers
@@ -101,6 +112,7 @@ namespace beckhoff_ads_hardware_interface
     PLCType plc_type;
     std::string command_interface_name;
     std::string fallback_state_interface_name; // The state interface name corresponding to the current command interface name
+    CommandFallback fallback = CommandFallback::HOLD_LAST;
   };
 
   class BeckhoffADSHardwareInterface : public hardware_interface::SystemInterface
@@ -139,6 +151,15 @@ namespace beckhoff_ads_hardware_interface
      * @returns Static text describing the code, or a generic fallback
      */
     static const char *adsErrorText(long error_code);
+
+    /**
+     * @brief Parses a command_fallback interface parameter into its enum
+     *
+     * @param policy_str Parameter text: hold_last, mirror_state or zero
+     * @param interface_name Interface the parameter belongs to, for the warning on a bad value
+     * @returns The matching policy, or HOLD_LAST when the text is empty or unrecognised
+     */
+    CommandFallback parseCommandFallback(const std::string &policy_str, const std::string &interface_name);
 
     /**
      * @brief Records a failed SUM-read round-trip for outage and recovery logs
@@ -201,6 +222,9 @@ namespace beckhoff_ads_hardware_interface
     std::vector<uint8_t> ads_buffer_sum_write_request_;
     std::vector<uint8_t> ads_buffer_sum_write_response_;
     size_t num_items_write_ = 0;
+
+    // Cycles on which a command interface carried no command and its fallback applied.
+    std::atomic<uint64_t> fallback_activations_{0};
 
     std::vector<ReadInstruction> ads_read_instructions_;
     std::vector<WriteInstruction> ads_write_instructions_;
