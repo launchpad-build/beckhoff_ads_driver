@@ -161,30 +161,65 @@ namespace beckhoff_ads_hardware_interface
         ads_write_layout_configure();
 
         // Request handles for all symbolic PLC variable names
+        // An unresolved handle used to be logged and then left in the sum buffers with a zero
+        // handle, so every round trip came back with a per-item error, read() faulted the
+        // component on the first cycle and the controller manager tore the whole stack down.
+        // One symbol the PLC had not been flashed with yet took the machine out. Drop the
+        // unresolved ones from the buffers instead, and only tolerate the ones declared
+        // optional; a required symbol that is missing fails configure, which is honest and
+        // happens before anything is running.
         RCLCPP_INFO(getLogger(), "Fetching ADS handles for configured PLC variables...");
-        for (auto &layout : ads_item_layouts_read_)
+        bool required_symbol_missing = false;
+
+        auto resolve_handles = [&](std::vector<ADSDataLayout> &layouts, const char *direction)
         {
-            try
+            for (auto &layout : layouts)
             {
-                layout.ads_handle_owner.emplace(ads_device_->GetHandle(layout.plc_name_symbolic));
-                layout.ads_handle = **layout.ads_handle_owner;
+                try
+                {
+                    layout.ads_handle_owner.emplace(ads_device_->GetHandle(layout.plc_name_symbolic));
+                    layout.ads_handle = **layout.ads_handle_owner;
+                    layout.handle_resolved = true;
+                }
+                catch (const std::exception &ex)
+                {
+                    layout.handle_resolved = false;
+                    if (layout.optional)
+                    {
+                        RCLCPP_WARN(getLogger(),
+                                    "\tOptional %s symbol '%s' is not on the PLC (%s). Skipping it; its interfaces keep their initial value.",
+                                    direction, layout.plc_name_symbolic.c_str(), ex.what());
+                    }
+                    else
+                    {
+                        RCLCPP_FATAL(getLogger(),
+                                     "\tRequired %s symbol '%s' is not on the PLC (%s). Flash the PLC project first, or mark the interface optional.",
+                                     direction, layout.plc_name_symbolic.c_str(), ex.what());
+                        required_symbol_missing = true;
+                    }
+                }
             }
-            catch (const std::exception &ex)
+
+            // Rebuild rather than erase-remove: ADSDataLayout owns an AdsHandle and so is
+            // move-constructible but not move-assignable, which remove_if needs.
+            std::vector<ADSDataLayout> resolved;
+            resolved.reserve(layouts.size());
+            for (auto &layout : layouts)
             {
-                RCLCPP_ERROR(getLogger(), "\tADS Exception getting handle for '%s': %s. Read operations for this variable will fail.", layout.plc_name_symbolic.c_str(), ex.what());
+                if (layout.handle_resolved)
+                {
+                    resolved.push_back(std::move(layout));
+                }
             }
-        }
-        for (auto &layout : ads_item_layouts_write_)
+            layouts = std::move(resolved);
+        };
+
+        resolve_handles(ads_item_layouts_read_, "read");
+        resolve_handles(ads_item_layouts_write_, "write");
+
+        if (required_symbol_missing)
         {
-            try
-            {
-                layout.ads_handle_owner.emplace(ads_device_->GetHandle(layout.plc_name_symbolic));
-                layout.ads_handle = **layout.ads_handle_owner;
-            }
-            catch (const std::exception &ex)
-            {
-                RCLCPP_ERROR(getLogger(), "\tADS Exception getting handle for '%s': %s. Write operations for this variable will fail.", layout.plc_name_symbolic.c_str(), ex.what());
-            }
+            return hardware_interface::CallbackReturn::ERROR;
         }
         RCLCPP_INFO(getLogger(), "\tHandles acquired");
 
@@ -420,6 +455,9 @@ namespace beckhoff_ads_hardware_interface
                     continue;
                 }
 
+                const bool interface_optional = descr.interface_info.parameters.count("optional") &&
+                                                descr.interface_info.parameters.at("optional") == "true";
+
                 // If this is the first time we see this symbol, create the layout
                 if (processed_plc_symbols.find(plc_symbol) == processed_plc_symbols.end())
                 {
@@ -428,6 +466,7 @@ namespace beckhoff_ads_hardware_interface
                     layout.num_elements = num_elements;
                     layout.plc_type = strToPlcType(plc_type_str);
                     layout.ros2_interfaces_.emplace(std::make_pair(plc_index, name));
+                    layout.optional = interface_optional;
 
                     if (layout.plc_type == PLCType::UNKNOWN || layout.plc_type == PLCType::STRING)
                     {
@@ -450,6 +489,8 @@ namespace beckhoff_ads_hardware_interface
 
                     // Add the interface name the layout
                     (*it).ros2_interfaces_.emplace(std::make_pair(plc_index, name));
+                    // a symbol is only skippable if every interface on it agrees
+                    (*it).optional = (*it).optional && interface_optional;
                 }
             }
         };
@@ -525,6 +566,8 @@ namespace beckhoff_ads_hardware_interface
                     fallback_str = descr.interface_info.parameters.at("command_fallback");
                 }
                 const CommandFallback fallback_policy = parseCommandFallback(fallback_str, name);
+                const bool interface_optional = descr.interface_info.parameters.count("optional") &&
+                                                descr.interface_info.parameters.at("optional") == "true";
 
                 if (processed_plc_symbols.find(plc_symbol) == processed_plc_symbols.end())
                 {
@@ -534,6 +577,7 @@ namespace beckhoff_ads_hardware_interface
                     layout.plc_type = strToPlcType(plc_type_str);
                     layout.ros2_interfaces_.emplace(std::make_pair(plc_index, name));
                     layout.fallback_policies_.emplace(name, fallback_policy);
+                    layout.optional = interface_optional;
 
                     if (layout.plc_type == PLCType::UNKNOWN || layout.plc_type == PLCType::STRING)
                     {
@@ -557,6 +601,8 @@ namespace beckhoff_ads_hardware_interface
                     // Add the command interface name the layout
                     (*it).ros2_interfaces_.emplace(std::make_pair(plc_index, name));
                     (*it).fallback_policies_.emplace(name, fallback_policy);
+                    // a symbol is only skippable if every interface on it agrees
+                    (*it).optional = (*it).optional && interface_optional;
                 }
             }
         };
