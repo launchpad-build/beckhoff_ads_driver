@@ -772,6 +772,10 @@ namespace beckhoff_ads_hardware_interface
         stat_read_failures_ = static_cast<double>(read_failures_total_.load(std::memory_order_relaxed));
         stat_write_failures_ = static_cast<double>(write_failures_total_.load(std::memory_order_relaxed));
         stat_fallback_activations_ = static_cast<double>(fallback_activations_.load(std::memory_order_relaxed));
+        stat_fallback_activations_per_cycle_ =
+            static_cast<double>(fallback_activations_cycle_.load(std::memory_order_relaxed));
+        stat_never_commanded_interfaces_ =
+            static_cast<double>(never_commanded_interfaces_.load(std::memory_order_relaxed));
         stat_heartbeat_ = static_cast<double>(heartbeat_counter_);
     }
 
@@ -785,6 +789,8 @@ namespace beckhoff_ads_hardware_interface
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_read_failures", &stat_read_failures_);
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_write_failures", &stat_write_failures_);
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_fallback_activations", &stat_fallback_activations_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_fallback_activations_per_cycle", &stat_fallback_activations_per_cycle_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_never_commanded_interfaces", &stat_never_commanded_interfaces_);
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_heartbeat", &stat_heartbeat_);
     }
 
@@ -971,7 +977,10 @@ namespace beckhoff_ads_hardware_interface
             return hardware_interface::return_type::OK;
         }
 
-        for (const auto &write_instruction : ads_write_instructions_)
+        uint64_t fallbacks_this_cycle = 0;
+        uint64_t never_commanded_this_cycle = 0;
+
+        for (auto &write_instruction : ads_write_instructions_)
         {
             uint8_t *ptr_write_buffer_destination_current = ads_buffer_sum_write_request_.data() + write_instruction.write_buffer_offset_data;
 
@@ -991,11 +1000,29 @@ namespace beckhoff_ads_hardware_interface
             double val = get_command(write_instruction.command_interface_name);
             set_command(write_instruction.command_interface_name, std::numeric_limits<double>::quiet_NaN());
 
+            if (!std::isnan(val))
+            {
+                write_instruction.has_been_commanded = true;
+            }
+
             if (std::isnan(val))
             {
-                // No controller wrote this interface on this cycle. Apply its fallback and
-                // count it, so a stall is distinguishable from a slow trajectory in the logs.
-                fallback_activations_.fetch_add(1, std::memory_order_relaxed);
+                // No controller wrote this interface on this cycle. Apply its fallback, and
+                // count it only if something has commanded this interface before, so a real
+                // dropout registers and an interface nobody drives stays quiet.
+                if (write_instruction.has_been_commanded)
+                {
+                    ++fallbacks_this_cycle;
+                    fallback_activations_.fetch_add(1, std::memory_order_relaxed);
+                    RCLCPP_WARN_THROTTLE(getLogger(), *logging_throttle_clock_, 5000,
+                                         "Command interface '%s' carried no command this cycle after having been "
+                                         "commanded before. Applying its fallback.",
+                                         write_instruction.command_interface_name.c_str());
+                }
+                else
+                {
+                    ++never_commanded_this_cycle;
+                }
 
                 if (write_instruction.fallback == CommandFallback::ZERO)
                 {
@@ -1091,6 +1118,9 @@ namespace beckhoff_ads_hardware_interface
                 break;
             }
         }
+
+        fallback_activations_cycle_.store(fallbacks_this_cycle, std::memory_order_relaxed);
+        never_commanded_interfaces_.store(never_commanded_this_cycle, std::memory_order_relaxed);
 
         refresh_transaction_statistics();
 

@@ -120,6 +120,9 @@ namespace beckhoff_ads_hardware_interface
     std::string fallback_state_interface_name; // The state interface name corresponding to the current command interface name
     CommandFallback fallback = CommandFallback::HOLD_LAST;
     bool is_heartbeat = false; // value comes from the interface's own counter, not a controller
+    // Set on the first cycle this interface carried a command. Until then its fallback is
+    // the normal case, not a dropout, and it must not count as one.
+    bool has_been_commanded = false;
   };
 
   class BeckhoffADSHardwareInterface : public hardware_interface::SystemInterface
@@ -283,8 +286,23 @@ namespace beckhoff_ads_hardware_interface
     std::atomic<uint64_t> read_failures_total_{0};
     std::atomic<uint64_t> write_failures_total_{0};
 
-    // Cycles on which a command interface carried no command and its fallback applied.
+    // Interface-cycles on which an interface that has carried a command before carried none
+    // and its fallback applied. Interfaces nothing has ever commanded are excluded, because
+    // write() clears every command interface to NaN after packing and a controller only
+    // writes the interfaces its most recent command message named. Counting those made the
+    // total grow every cycle whatever the controllers did, which is what it was meant to
+    // detect: measured at exactly 4.000 per cycle on the LMCF gantry after an engage,
+    // falling to 1.000 once a message named four of the five gpio commands, the remainder
+    // being an enable nothing had ever written.
     std::atomic<uint64_t> fallback_activations_{0};
+
+    // The same count over the most recent write() cycle only. Cumulative totals hide when a
+    // dropout started and when it stopped; the rate is what a reader wants.
+    std::atomic<uint64_t> fallback_activations_cycle_{0};
+
+    // How many command interfaces have never carried a command. A quiet interface lands
+    // here once and stays put, so it is legible without inflating the dropout count.
+    std::atomic<uint64_t> never_commanded_interfaces_{0};
 
     // Introspected mirrors. Only the control loop writes these.
     double stat_read_rtt_ms_{0.0};
@@ -295,6 +313,8 @@ namespace beckhoff_ads_hardware_interface
     double stat_read_failures_{0.0};
     double stat_write_failures_{0.0};
     double stat_fallback_activations_{0.0};
+    double stat_fallback_activations_per_cycle_{0.0};
+    double stat_never_commanded_interfaces_{0.0};
     double stat_heartbeat_{0.0};
 
     std::vector<ReadInstruction> ads_read_instructions_;
