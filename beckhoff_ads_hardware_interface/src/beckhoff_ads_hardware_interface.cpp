@@ -115,6 +115,12 @@ namespace beckhoff_ads_hardware_interface
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_configure(
         const rclcpp_lifecycle::State & /*previous_state*/)
     {
+        // Join the I/O threads before anything below touches ads_device_. Both loops call
+        // through it on every round-trip, and configure_ads_device() destroys the old device
+        // when it assigns the new one. A reconfigure after an error transition is the case
+        // that reaches here with the threads still running.
+        stop_io_threads();
+
         // Release any symbol handles from a previous configure cycle before configure_ads_device()
         // replaces ads_device_ below; the handle deleters call through ads_device_.
         release_ads_handles();
@@ -1211,6 +1217,20 @@ namespace beckhoff_ads_hardware_interface
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_shutdown(
         const rclcpp_lifecycle::State & /*previous_state*/)
     {
+        teardown_ads_device();
+        return hardware_interface::CallbackReturn::SUCCESS;
+    }
+
+    hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_error(
+        const rclcpp_lifecycle::State & /*previous_state*/)
+    {
+        RCLCPP_ERROR(getLogger(), "ADS component entering the error state. Dropping the link.");
+        teardown_ads_device();
+        return hardware_interface::CallbackReturn::SUCCESS;
+    }
+
+    void BeckhoffADSHardwareInterface::teardown_ads_device()
+    {
         RCLCPP_INFO(getLogger(), "Releasing ADS resources...");
         // Stop the worker threads before touching the device; both call through ads_device_.
         // Safe to call even if on_deactivate already joined them.
@@ -1218,13 +1238,8 @@ namespace beckhoff_ads_hardware_interface
         // Release symbol handles before the device: their deleters call DeleteSymbolHandle
         // through ads_device_. Skipping this is what segfaulted on Ctrl-C.
         release_ads_handles();
-        if (ads_device_)
-        {
-            ads_device_.reset();
-        }
+        ads_device_.reset();
         RCLCPP_INFO(getLogger(), "ADS resources released.");
-
-        return hardware_interface::CallbackReturn::SUCCESS;
     }
 
     void BeckhoffADSHardwareInterface::release_ads_handles()

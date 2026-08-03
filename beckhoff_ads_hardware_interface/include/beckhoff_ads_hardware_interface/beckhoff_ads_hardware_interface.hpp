@@ -141,6 +141,13 @@ namespace beckhoff_ads_hardware_interface
     hardware_interface::CallbackReturn on_shutdown(
         const rclcpp_lifecycle::State &previous_state) override;
 
+    // An ERROR out of read()/write() transitions the component straight here, without
+    // on_deactivate or on_shutdown running. Without this override the I/O threads kept
+    // running on a component the controller manager had already given up on, and the next
+    // on_configure replaced ads_device_ underneath them.
+    hardware_interface::CallbackReturn on_error(
+        const rclcpp_lifecycle::State &previous_state) override;
+
     hardware_interface::return_type read(
         const rclcpp::Time &time, const rclcpp::Duration &period) override;
 
@@ -206,8 +213,16 @@ namespace beckhoff_ads_hardware_interface
     size_t plcTypeByteSize(PLCType type_enum);
 
     // ADS Communication objects
+    // The reader and writer threads dereference this on every round-trip without holding a
+    // lock, so every site that resets or replaces it MUST join both threads first
+    // (stop_io_threads). Otherwise a thread is left calling a method on a destroyed AdsDevice,
+    // whose m_LocalPort is already freed.
     std::unique_ptr<AdsDevice> ads_device_; // Manages the route/connection to the PLC
     bool configure_ads_device();
+
+    // Joins the I/O threads, releases the symbol handles and drops the device, in the only
+    // order that is safe. Shared by on_shutdown and on_error.
+    void teardown_ads_device();
 
     // Releases every cached PLC symbol handle (ADSDataLayout::ads_handle_owner). Each handle's
     // deleter calls DeleteSymbolHandle through ads_device_, so this MUST run while ads_device_
