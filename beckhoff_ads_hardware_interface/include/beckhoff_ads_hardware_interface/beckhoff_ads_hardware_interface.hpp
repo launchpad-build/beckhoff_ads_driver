@@ -206,6 +206,11 @@ namespace beckhoff_ads_hardware_interface
     // A link must stay good this long before an outage is declared over.
     static constexpr std::chrono::seconds RECOVERY_STABLE_PERIOD{1};
 
+    // A comms outage shorter than this is ridden out on the last cached values; only once it
+    // outlives the window does read()/write() surface an error and let the controller manager
+    // tear the stack down. Overridable via the comms_outage_grace_ms hardware parameter.
+    std::chrono::milliseconds comms_outage_grace_{1000};
+
     // ========= PLC ==============================
 
     // PLC Type and Size Helpers
@@ -214,7 +219,7 @@ namespace beckhoff_ads_hardware_interface
 
     // ADS Communication objects
     // The reader and writer threads dereference this on every round-trip without holding a
-    // lock, so every site that resets or replaces it MUST join both threads first
+    // lock, so every site that resets or replaces it has to join both threads first
     // (stop_io_threads). Otherwise a thread is left calling a method on a destroyed AdsDevice,
     // whose m_LocalPort is already freed.
     std::unique_ptr<AdsDevice> ads_device_; // Manages the route/connection to the PLC
@@ -319,7 +324,7 @@ namespace beckhoff_ads_hardware_interface
     std::vector<uint8_t> write_pending_request_; // latest packed SUM-write request awaiting send
     bool write_pending_ = false;                 // a fresh buffer is waiting (guarded by write_mutex_)
     bool write_stop_ = false;                     // stop request (guarded by write_mutex_)
-    std::atomic<bool> write_comms_ok_{true};      // last write transaction health, surfaced by write()
+    std::atomic<bool> write_hard_fault_{false};   // outage outlived the grace window, surfaced by write()
     // Consecutive failed SUM-write round-trips, for outage and recovery logs. Writer thread only.
     size_t write_consecutive_failures_ = 0;
     std::chrono::steady_clock::time_point write_outage_start_;
@@ -330,7 +335,7 @@ namespace beckhoff_ads_hardware_interface
     void reader_loop();
     std::thread read_thread_;
     std::atomic<bool> read_stop_{false};
-    std::atomic<bool> read_comms_ok_{true};         // last read transaction health, surfaced by read()
+    std::atomic<bool> read_hard_fault_{false};      // outage outlived the grace window, surfaced by read()
     std::deque<std::atomic<double>> polling_read_cache_; // one slot per read instruction; deque keeps addresses stable
     long long read_poll_period_ns_ = 0;             // optional pacing between SUM reads; 0 = unpaced
     // Consecutive failed SUM-read round-trips, for outage and recovery logs. Reader thread only.

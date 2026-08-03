@@ -144,6 +144,27 @@ namespace beckhoff_ads_hardware_interface
             RCLCPP_WARN(getLogger(), "Invalid read_poll_period_ms: %s. Running unpaced.", ex.what());
         }
 
+        // How long a comms outage may persist before read()/write() surface an error to the
+        // controller manager. Within this window the last cached values are held. 0 = fail on the
+        // first failed cycle (legacy behaviour). Absent or invalid = default.
+        try
+        {
+            auto grace_it = info_.hardware_parameters.find("comms_outage_grace_ms");
+            if (grace_it != info_.hardware_parameters.end())
+            {
+                const double ms = std::stod(grace_it->second);
+                if (std::isfinite(ms) && ms >= 0.0)
+                {
+                    comms_outage_grace_ = std::chrono::milliseconds(static_cast<long long>(ms));
+                }
+            }
+        }
+        catch (const std::exception &ex)
+        {
+            RCLCPP_WARN(getLogger(), "Invalid comms_outage_grace_ms: %s. Using default %ld ms.",
+                        ex.what(), static_cast<long>(comms_outage_grace_.count()));
+        }
+
         // Optional link heartbeat. The PLC watches this counter for movement, so it can tell
         // a live control stack from one that died mid-move. Absent = disabled, which is what
         // every stack that has not asked for it gets.
@@ -683,9 +704,9 @@ namespace beckhoff_ads_hardware_interface
             set_state(ads_read_instructions_[i].state_interface_name,
                       polling_read_cache_[i].load(std::memory_order_acquire));
         }
-        return read_comms_ok_.load(std::memory_order_acquire)
-                   ? hardware_interface::return_type::OK
-                   : hardware_interface::return_type::ERROR;
+        return read_hard_fault_.load(std::memory_order_acquire)
+                   ? hardware_interface::return_type::ERROR
+                   : hardware_interface::return_type::OK;
     }
 
     const char *BeckhoffADSHardwareInterface::adsErrorText(long error_code)
@@ -769,24 +790,34 @@ namespace beckhoff_ads_hardware_interface
 
     void BeckhoffADSHardwareInterface::record_read_failure()
     {
+        const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
         read_failures_total_.fetch_add(1, std::memory_order_relaxed);
         if (read_consecutive_failures_ == 0)
         {
-            read_outage_start_ = std::chrono::steady_clock::now();
+            read_outage_start_ = now;
         }
         ++read_consecutive_failures_;
         read_recovery_stable_since_.reset();
+        if (now - read_outage_start_ >= comms_outage_grace_)
+        {
+            read_hard_fault_.store(true, std::memory_order_release);
+        }
     }
 
     void BeckhoffADSHardwareInterface::record_write_failure()
     {
+        const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
         write_failures_total_.fetch_add(1, std::memory_order_relaxed);
         if (write_consecutive_failures_ == 0)
         {
-            write_outage_start_ = std::chrono::steady_clock::now();
+            write_outage_start_ = now;
         }
         ++write_consecutive_failures_;
         write_recovery_stable_since_.reset();
+        if (now - write_outage_start_ >= comms_outage_grace_)
+        {
+            write_hard_fault_.store(true, std::memory_order_release);
+        }
     }
 
     void BeckhoffADSHardwareInterface::reader_loop()
@@ -849,7 +880,6 @@ namespace beckhoff_ads_hardware_interface
                                           ads_sum_read_error, adsErrorText(ads_sum_read_error));
                 }
                 record_read_failure();
-                read_comms_ok_.store(false, std::memory_order_release);
                 std::this_thread::sleep_for(ERROR_BACKOFF);
                 continue;
             }
@@ -860,34 +890,15 @@ namespace beckhoff_ads_hardware_interface
                                       "ADS Sum Read size mismatch. Expected %zu, Got %u.",
                                       ads_buffer_sum_read_response_.size(), bytes_read_from_plc);
                 record_read_failure();
-                read_comms_ok_.store(false, std::memory_order_release);
                 std::this_thread::sleep_for(ERROR_BACKOFF);
                 continue;
             }
 
-            // Declare recovery only after the link has been good for a stable period, so a
-            // flapping link logs one outage instead of an error/recovery pair per cycle.
-            if (read_consecutive_failures_ > 0)
-            {
-                const std::chrono::steady_clock::time_point now_steady = std::chrono::steady_clock::now();
-                if (!read_recovery_stable_since_)
-                {
-                    read_recovery_stable_since_ = now_steady;
-                }
-                else if (now_steady - *read_recovery_stable_since_ >= RECOVERY_STABLE_PERIOD)
-                {
-                    const int64_t outage_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                  *read_recovery_stable_since_ - read_outage_start_)
-                                                  .count();
-                    RCLCPP_INFO(getLogger(),
-                                "ADS Sum Read recovered after %zu failed cycles (%.1f s).",
-                                read_consecutive_failures_, static_cast<double>(outage_ms) / 1000.0);
-                    read_consecutive_failures_ = 0;
-                    read_recovery_stable_since_.reset();
-                }
-            }
-
-            bool any_item_read_failed = false;
+            // A single missing symbol (0x710) reports per item while the round-trip itself
+            // succeeds. Hold that item's last value and keep going; a read-only telemetry symbol
+            // that is absent or renamed must not deactivate the whole hardware component. Only an
+            // outage that takes out every item is treated as a link failure.
+            size_t items_failed = 0;
             for (size_t i = 0; i < ads_read_instructions_.size(); ++i)
             {
                 const auto &read_instruction = ads_read_instructions_[i];
@@ -902,7 +913,7 @@ namespace beckhoff_ads_hardware_interface
                                          "ADS Sum Read operation corresponding to the state interface '%s' failed: 0x%X (%s).",
                                          read_instruction.state_interface_name.c_str(), item_error_code,
                                          adsErrorText(static_cast<long>(item_error_code)));
-                    any_item_read_failed = true;
+                    ++items_failed;
                     continue;
                 }
 
@@ -910,7 +921,38 @@ namespace beckhoff_ads_hardware_interface
                 polling_read_cache_[i].store(decode_plc_element(read_instruction.plc_type, ptr_plc_element_current),
                                              std::memory_order_release);
             }
-            read_comms_ok_.store(!any_item_read_failed, std::memory_order_release);
+
+            if (items_failed == ads_read_instructions_.size() && !ads_read_instructions_.empty())
+            {
+                // Every symbol is unavailable though the link answered (e.g. the program was
+                // swapped): treat as an outage so the grace window still backstops it.
+                record_read_failure();
+            }
+            else
+            {
+                read_hard_fault_.store(false, std::memory_order_release);
+                // Declare recovery only after the link has been good for a stable period, so a
+                // flapping link logs one outage instead of an error/recovery pair per cycle.
+                if (read_consecutive_failures_ > 0)
+                {
+                    const std::chrono::steady_clock::time_point now_steady = std::chrono::steady_clock::now();
+                    if (!read_recovery_stable_since_)
+                    {
+                        read_recovery_stable_since_ = now_steady;
+                    }
+                    else if (now_steady - *read_recovery_stable_since_ >= RECOVERY_STABLE_PERIOD)
+                    {
+                        const int64_t outage_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                      *read_recovery_stable_since_ - read_outage_start_)
+                                                      .count();
+                        RCLCPP_INFO(getLogger(),
+                                    "ADS Sum Read recovered after %zu failed cycles (%.1f s).",
+                                    read_consecutive_failures_, static_cast<double>(outage_ms) / 1000.0);
+                        read_consecutive_failures_ = 0;
+                        read_recovery_stable_since_.reset();
+                    }
+                }
+            }
 
             // Optional pacing to cap PLC load; period 0 = unpaced.
             if (read_poll_period_ns_ > 0)
@@ -1069,9 +1111,9 @@ namespace beckhoff_ads_hardware_interface
         }
         write_cv_.notify_one();
 
-        return write_comms_ok_.load(std::memory_order_acquire)
-                   ? hardware_interface::return_type::OK
-                   : hardware_interface::return_type::ERROR;
+        return write_hard_fault_.load(std::memory_order_acquire)
+                   ? hardware_interface::return_type::ERROR
+                   : hardware_interface::return_type::OK;
     }
 
     void BeckhoffADSHardwareInterface::writer_loop()
@@ -1133,7 +1175,6 @@ namespace beckhoff_ads_hardware_interface
                                           ads_sum_write_error, adsErrorText(ads_sum_write_error));
                 }
                 record_write_failure();
-                write_comms_ok_.store(false, std::memory_order_release);
                 continue;
             }
 
@@ -1143,34 +1184,13 @@ namespace beckhoff_ads_hardware_interface
                                       "ADS Sum Write response size mismatch (error codes). Expected %zu, Got %u.",
                                       ads_buffer_sum_write_response_.size(), bytes_response_buffer_from_plc);
                 record_write_failure();
-                write_comms_ok_.store(false, std::memory_order_release);
                 continue;
             }
 
-            // Declare recovery only after the link has been good for a stable period, so a
-            // flapping link logs one outage instead of an error/recovery pair per round-trip.
-            if (write_consecutive_failures_ > 0)
-            {
-                const std::chrono::steady_clock::time_point now_steady = std::chrono::steady_clock::now();
-                if (!write_recovery_stable_since_)
-                {
-                    write_recovery_stable_since_ = now_steady;
-                }
-                else if (now_steady - *write_recovery_stable_since_ >= RECOVERY_STABLE_PERIOD)
-                {
-                    const int64_t outage_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                  *write_recovery_stable_since_ - write_outage_start_)
-                                                  .count();
-                    RCLCPP_INFO(getLogger(),
-                                "ADS Sum Write recovered after %zu failed round-trips (%.1f s).",
-                                write_consecutive_failures_, static_cast<double>(outage_ms) / 1000.0);
-                    write_consecutive_failures_ = 0;
-                    write_recovery_stable_since_.reset();
-                }
-            }
-
             // One error code per write item, in request order: index i maps to layout i.
-            bool any_item_write_failed = false;
+            // A single rejected symbol must not deactivate the whole component; only an outage
+            // that fails every item is treated as a link failure.
+            size_t items_failed = 0;
             for (size_t i = 0; i < num_items_write_; ++i)
             {
                 uint32_t item_error_code;
@@ -1181,18 +1201,47 @@ namespace beckhoff_ads_hardware_interface
                                          "ADS Sum Write sub-op for '%s' (handle 0x%X) failed: 0x%X (%s)",
                                          ads_item_layouts_write_[i].plc_name_symbolic.c_str(), ads_item_layouts_write_[i].ads_handle, item_error_code,
                                          adsErrorText(static_cast<long>(item_error_code)));
-                    any_item_write_failed = true;
+                    ++items_failed;
                 }
             }
-            write_comms_ok_.store(!any_item_write_failed, std::memory_order_release);
+
+            if (items_failed == num_items_write_ && num_items_write_ > 0)
+            {
+                record_write_failure();
+            }
+            else
+            {
+                write_hard_fault_.store(false, std::memory_order_release);
+                // Declare recovery only after the link has been good for a stable period, so a
+                // flapping link logs one outage instead of an error/recovery pair per round-trip.
+                if (write_consecutive_failures_ > 0)
+                {
+                    const std::chrono::steady_clock::time_point now_steady = std::chrono::steady_clock::now();
+                    if (!write_recovery_stable_since_)
+                    {
+                        write_recovery_stable_since_ = now_steady;
+                    }
+                    else if (now_steady - *write_recovery_stable_since_ >= RECOVERY_STABLE_PERIOD)
+                    {
+                        const int64_t outage_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                      *write_recovery_stable_since_ - write_outage_start_)
+                                                      .count();
+                        RCLCPP_INFO(getLogger(),
+                                    "ADS Sum Write recovered after %zu failed round-trips (%.1f s).",
+                                    write_consecutive_failures_, static_cast<double>(outage_ms) / 1000.0);
+                        write_consecutive_failures_ = 0;
+                        write_recovery_stable_since_.reset();
+                    }
+                }
+            }
         }
     }
 
     void BeckhoffADSHardwareInterface::start_io_threads()
     {
         // Clear any stale fault before (re)starting.
-        write_comms_ok_.store(true, std::memory_order_release);
-        read_comms_ok_.store(true, std::memory_order_release);
+        write_hard_fault_.store(false, std::memory_order_release);
+        read_hard_fault_.store(false, std::memory_order_release);
         read_consecutive_failures_ = 0;
         write_consecutive_failures_ = 0;
         read_recovery_stable_since_.reset();
