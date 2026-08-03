@@ -272,151 +272,171 @@ namespace beckhoff_ads_hardware_interface
 
     bool BeckhoffADSHardwareInterface::build_sum_read_buffers()
     {
+        // Everything derived from the layouts is rebuilt from scratch on every configure cycle.
+        // The instruction vector used to accumulate instead, while the response buffer was
+        // resized to the current layout count, so an instruction surviving from a cycle that
+        // resolved more symbols carried an offset past the end of the smaller buffer.
+        ads_read_instructions_.clear();
+        polling_read_cache_.clear();
+        ads_buffer_sum_read_request_.clear();
+        ads_buffer_sum_read_response_.clear();
+
         num_items_read_ = ads_item_layouts_read_.size();
         if (num_items_read_ == 0)
         {
             RCLCPP_INFO(getLogger(), "No items to configure for ADS Sum READ.");
-            return true;
         }
-        RCLCPP_INFO(getLogger(), "Building ADS sum READ buffer...");
-
-        size_t total_error_block_size = num_items_read_ * sizeof(uint32_t);
-        size_t total_data_block_size = 0;
-        for (const auto &layout : ads_item_layouts_read_)
+        else
         {
-            total_data_block_size += layout.plc_element_byte_size * layout.num_elements;
-        }
+            RCLCPP_INFO(getLogger(), "Building ADS sum READ buffer...");
 
-        ads_buffer_sum_read_response_.resize(total_error_block_size + total_data_block_size);
-        ads_buffer_sum_read_request_.clear();
-
-        size_t current_data_offset = 0;
-        size_t current_error_offset = 0;
-
-        for (auto &layout : ads_item_layouts_read_)
-        {
-            layout.offset_in_read_response_data = total_error_block_size + current_data_offset;
-            layout.offset_in_read_response_error = current_error_offset;
-
-            ADS_ITEM_REQ_HEADER header;
-            header.indexGroup = ADSIGRP_SYM_VALBYHND;
-            header.indexOffset = layout.ads_handle;
-            header.NumBytesData = layout.plc_element_byte_size * layout.num_elements;
-            const uint8_t *ptr = reinterpret_cast<const uint8_t *>(&header);
-            ads_buffer_sum_read_request_.insert(ads_buffer_sum_read_request_.end(), ptr, ptr + sizeof(ADS_ITEM_REQ_HEADER));
-
-            // For interfaces targeting the same PLC symbol
-            for (const auto &[index, interface_name] : layout.ros2_interfaces_)
+            size_t total_error_block_size = num_items_read_ * sizeof(uint32_t);
+            size_t total_data_block_size = 0;
+            for (const auto &layout : ads_item_layouts_read_)
             {
-                // Fill the read instruction vector
-                ReadInstruction read_instruction;
-                read_instruction.read_buffer_offset_error_code = layout.offset_in_read_response_error;
-                read_instruction.read_buffer_offset_data = layout.offset_in_read_response_data + index * layout.plc_element_byte_size;
-                read_instruction.plc_type = layout.plc_type;
-                read_instruction.state_interface_name = interface_name;
-
-                // The state interfaces' names are ordered by ascending indexes of the PLC array thanks to layout.ros2_interfaces_ being a map
-                ads_read_instructions_.push_back(read_instruction);
+                total_data_block_size += layout.plc_element_byte_size * layout.num_elements;
             }
 
-            current_data_offset += header.NumBytesData;
-            current_error_offset += sizeof(uint32_t);
-        }
-        // One cache slot per read instruction for the reader thread. Default to NaN so read()
-        // reports "no sample yet" until the first SUM read completes. A deque keeps each slot's
-        // address stable; std::atomic<double> is neither copyable nor movable.
-        polling_read_cache_.clear();
-        for (size_t i = 0; i < ads_read_instructions_.size(); ++i)
-        {
-            polling_read_cache_.emplace_back(std::numeric_limits<double>::quiet_NaN());
+            ads_buffer_sum_read_response_.resize(total_error_block_size + total_data_block_size);
+
+            size_t current_data_offset = 0;
+            size_t current_error_offset = 0;
+
+            for (auto &layout : ads_item_layouts_read_)
+            {
+                layout.offset_in_read_response_data = total_error_block_size + current_data_offset;
+                layout.offset_in_read_response_error = current_error_offset;
+
+                ADS_ITEM_REQ_HEADER header;
+                header.indexGroup = ADSIGRP_SYM_VALBYHND;
+                header.indexOffset = layout.ads_handle;
+                header.NumBytesData = layout.plc_element_byte_size * layout.num_elements;
+                const uint8_t *ptr = reinterpret_cast<const uint8_t *>(&header);
+                ads_buffer_sum_read_request_.insert(ads_buffer_sum_read_request_.end(), ptr, ptr + sizeof(ADS_ITEM_REQ_HEADER));
+
+                // For interfaces targeting the same PLC symbol
+                for (const auto &[index, interface_name] : layout.ros2_interfaces_)
+                {
+                    // Fill the read instruction vector
+                    ReadInstruction read_instruction;
+                    read_instruction.read_buffer_offset_error_code = layout.offset_in_read_response_error;
+                    read_instruction.read_buffer_offset_data = layout.offset_in_read_response_data + index * layout.plc_element_byte_size;
+                    read_instruction.plc_type = layout.plc_type;
+                    read_instruction.state_interface_name = interface_name;
+
+                    // The state interfaces' names are ordered by ascending indexes of the PLC array thanks to layout.ros2_interfaces_ being a map
+                    ads_read_instructions_.push_back(read_instruction);
+                }
+
+                current_data_offset += header.NumBytesData;
+                current_error_offset += sizeof(uint32_t);
+            }
+            // One cache slot per read instruction for the reader thread. Default to NaN so read()
+            // reports "no sample yet" until the first SUM read completes. A deque keeps each slot's
+            // address stable; std::atomic<double> is neither copyable nor movable.
+            for (size_t i = 0; i < ads_read_instructions_.size(); ++i)
+            {
+                polling_read_cache_.emplace_back(std::numeric_limits<double>::quiet_NaN());
+            }
+
+            RCLCPP_INFO(getLogger(), "ADS Sum READ configured for %zu items. Request: %zu bytes, Response: %zu bytes.",
+                        num_items_read_, ads_buffer_sum_read_request_.size(), ads_buffer_sum_read_response_.size());
         }
 
-        RCLCPP_INFO(getLogger(), "ADS Sum READ configured for %zu items. Request: %zu bytes, Response: %zu bytes.",
-                    num_items_read_, ads_buffer_sum_read_request_.size(), ads_buffer_sum_read_response_.size());
         return true;
     }
 
     bool BeckhoffADSHardwareInterface::build_sum_write_buffers()
     {
         RCLCPP_INFO(getLogger(), "Building ADS sum WRITE buffer...");
+
+        // As on the read side, a stale instruction would pack a command into a buffer that is
+        // no longer that large. write() runs on the control loop, so there the overrun is a
+        // heap write rather than a read.
+        ads_write_instructions_.clear();
+        ads_buffer_sum_write_request_.clear();
+        ads_buffer_sum_write_response_.clear();
+
         num_items_write_ = ads_item_layouts_write_.size();
         if (num_items_write_ == 0)
         {
             RCLCPP_INFO(getLogger(), "No items to configure for ADS Sum WRITE.");
-            return true;
         }
-
-        size_t total_data_size = 0;
-        size_t total_header_size = num_items_write_ * sizeof(ADS_ITEM_REQ_HEADER);
-        for (const auto &layout : ads_item_layouts_write_)
+        else
         {
-            total_data_size += layout.plc_element_byte_size * layout.num_elements;
-        }
-
-        ads_buffer_sum_write_request_.resize(total_header_size + total_data_size);
-        ads_buffer_sum_write_response_.resize(num_items_write_ * sizeof(uint32_t));
-
-        auto *header_block_ptr = reinterpret_cast<ADS_ITEM_REQ_HEADER *>(ads_buffer_sum_write_request_.data());
-        size_t current_data_offset = 0;
-        size_t i = 0; // Index for the header block pointer
-
-        for (auto &layout : ads_item_layouts_write_)
-        {
-            header_block_ptr[i].indexGroup = ADSIGRP_SYM_VALBYHND;
-            header_block_ptr[i].indexOffset = layout.ads_handle;
-            header_block_ptr[i].NumBytesData = layout.plc_element_byte_size * layout.num_elements;
-
-            layout.offset_in_write_request_data = total_header_size + current_data_offset;
-
-            // For interfaces targeting the same PLC symbol
-            for (const auto &[index, interface_name] : layout.ros2_interfaces_)
+            size_t total_data_size = 0;
+            size_t total_header_size = num_items_write_ * sizeof(ADS_ITEM_REQ_HEADER);
+            for (const auto &layout : ads_item_layouts_write_)
             {
-                // Fill the write instruction vector
-                WriteInstruction write_instruction;
-                write_instruction.write_buffer_offset_data = layout.offset_in_write_request_data + index * layout.plc_element_byte_size;
-                write_instruction.plc_type = layout.plc_type;
-                write_instruction.command_interface_name = interface_name;
-                write_instruction.fallback_state_interface_name = "";
-                write_instruction.is_heartbeat = (interface_name == HEARTBEAT_INTERFACE_NAME);
-
-                // What to send when a controller stops writing this interface. Holding the
-                // last value is what every stack has actually had, so it stays the default.
-                // Mirroring the state interface is opt-in, because for a position command it
-                // turns "no command" into "stay put", which reads as a slow trajectory rather
-                // than as a stall. Zero is for velocity commands, where holding the last value
-                // means a dead controller keeps a feed-forward alive.
-                const auto policy_it = layout.fallback_policies_.find(interface_name);
-                write_instruction.fallback = (policy_it != layout.fallback_policies_.end())
-                                                 ? policy_it->second
-                                                 : CommandFallback::HOLD_LAST;
-
-                if (write_instruction.fallback == CommandFallback::MIRROR_STATE)
-                {
-                    const auto state_it = layout.state_command_interfaces_map_.find(interface_name);
-                    if (state_it != layout.state_command_interfaces_map_.end())
-                    {
-                        write_instruction.fallback_state_interface_name = state_it->second;
-                    }
-                    else
-                    {
-                        RCLCPP_WARN(getLogger(),
-                                    "Command interface '%s' asks for a mirror_state fallback but no state interface "
-                                    "shares its PLC symbol. Holding the last value instead.",
-                                    interface_name.c_str());
-                        write_instruction.fallback = CommandFallback::HOLD_LAST;
-                    }
-                }
-
-                // The command interfaces' names are ordered by ascending indexes of the PLC array thanks to layout.ros2_interfaces_ being a map
-                ads_write_instructions_.push_back(write_instruction);
+                total_data_size += layout.plc_element_byte_size * layout.num_elements;
             }
 
-            current_data_offset += header_block_ptr[i].NumBytesData;
-            i++;
+            ads_buffer_sum_write_request_.resize(total_header_size + total_data_size);
+            ads_buffer_sum_write_response_.resize(num_items_write_ * sizeof(uint32_t));
+
+            auto *header_block_ptr = reinterpret_cast<ADS_ITEM_REQ_HEADER *>(ads_buffer_sum_write_request_.data());
+            size_t current_data_offset = 0;
+            size_t i = 0; // Index for the header block pointer
+
+            for (auto &layout : ads_item_layouts_write_)
+            {
+                header_block_ptr[i].indexGroup = ADSIGRP_SYM_VALBYHND;
+                header_block_ptr[i].indexOffset = layout.ads_handle;
+                header_block_ptr[i].NumBytesData = layout.plc_element_byte_size * layout.num_elements;
+
+                layout.offset_in_write_request_data = total_header_size + current_data_offset;
+
+                // For interfaces targeting the same PLC symbol
+                for (const auto &[index, interface_name] : layout.ros2_interfaces_)
+                {
+                    // Fill the write instruction vector
+                    WriteInstruction write_instruction;
+                    write_instruction.write_buffer_offset_data = layout.offset_in_write_request_data + index * layout.plc_element_byte_size;
+                    write_instruction.plc_type = layout.plc_type;
+                    write_instruction.command_interface_name = interface_name;
+                    write_instruction.fallback_state_interface_name = "";
+                    write_instruction.is_heartbeat = (interface_name == HEARTBEAT_INTERFACE_NAME);
+
+                    // What to send when a controller stops writing this interface. Holding the
+                    // last value is what every stack has actually had, so it stays the default.
+                    // Mirroring the state interface is opt-in, because for a position command it
+                    // turns "no command" into "stay put", which reads as a slow trajectory rather
+                    // than as a stall. Zero is for velocity commands, where holding the last value
+                    // means a dead controller keeps a feed-forward alive.
+                    const auto policy_it = layout.fallback_policies_.find(interface_name);
+                    write_instruction.fallback = (policy_it != layout.fallback_policies_.end())
+                                                     ? policy_it->second
+                                                     : CommandFallback::HOLD_LAST;
+
+                    if (write_instruction.fallback == CommandFallback::MIRROR_STATE)
+                    {
+                        const auto state_it = layout.state_command_interfaces_map_.find(interface_name);
+                        if (state_it != layout.state_command_interfaces_map_.end())
+                        {
+                            write_instruction.fallback_state_interface_name = state_it->second;
+                        }
+                        else
+                        {
+                            RCLCPP_WARN(getLogger(),
+                                        "Command interface '%s' asks for a mirror_state fallback but no state interface "
+                                        "shares its PLC symbol. Holding the last value instead.",
+                                        interface_name.c_str());
+                            write_instruction.fallback = CommandFallback::HOLD_LAST;
+                        }
+                    }
+
+                    // The command interfaces' names are ordered by ascending indexes of the PLC array thanks to layout.ros2_interfaces_ being a map
+                    ads_write_instructions_.push_back(write_instruction);
+                }
+
+                current_data_offset += header_block_ptr[i].NumBytesData;
+                i++;
+            }
+
+            RCLCPP_INFO(getLogger(), "ADS Sum WRITE configured for %zu items. Request: %zu bytes, Response: %zu bytes.",
+                        num_items_write_, ads_buffer_sum_write_request_.size(), ads_buffer_sum_write_response_.size());
         }
 
-        RCLCPP_INFO(getLogger(), "ADS Sum WRITE configured for %zu items. Request: %zu bytes, Response: %zu bytes.",
-                    num_items_write_, ads_buffer_sum_write_request_.size(), ads_buffer_sum_write_response_.size());
         return true;
     }
 
