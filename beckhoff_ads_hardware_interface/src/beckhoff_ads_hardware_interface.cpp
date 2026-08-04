@@ -633,9 +633,9 @@ namespace beckhoff_ads_hardware_interface
                     write_instruction.plc_type = layout.plc_type;
                     write_instruction.command_interface_name = interface_name;
                     write_instruction.fallback_state_interface_name = "";
-                    write_instruction.is_heartbeat = (interface_name == HEARTBEAT_INTERFACE_NAME);
+                    write_instruction.source = classifyWriteValueSource(interface_name);
                     write_instruction.layout_index = i;
-                    if (!write_instruction.is_heartbeat)
+                    if (write_instruction.source == WriteValueSource::CONTROLLER)
                     {
                         write_instruction.command_handle = get_command_interface_handle(interface_name);
                     }
@@ -669,7 +669,7 @@ namespace beckhoff_ads_hardware_interface
                         }
                     }
 
-                    if (write_instruction.is_heartbeat)
+                    if (write_instruction.source != WriteValueSource::CONTROLLER)
                     {
                         write_instruction.seeded = true;
                     }
@@ -1073,6 +1073,16 @@ namespace beckhoff_ads_hardware_interface
         return text;
     }
 
+    WriteValueSource BeckhoffADSHardwareInterface::classifyWriteValueSource(const std::string &interface_name)
+    {
+        WriteValueSource result = WriteValueSource::CONTROLLER;
+        if (interface_name == HEARTBEAT_INTERFACE_NAME)
+        {
+            result = WriteValueSource::HEARTBEAT;
+        }
+        return result;
+    }
+
     CommandFallback BeckhoffADSHardwareInterface::parseCommandFallback(
         const std::string &policy_str, const std::string &interface_name)
     {
@@ -1339,7 +1349,7 @@ namespace beckhoff_ads_hardware_interface
         {
             uint8_t *ptr_write_buffer_destination_current = ads_buffer_sum_write_request_.data() + write_instruction.write_buffer_offset_data;
 
-            if (write_instruction.is_heartbeat)
+            if (write_instruction.source == WriteValueSource::HEARTBEAT)
             {
                 // Wrapping is fine and eventually certain: the PLC watches for the value
                 // changing, never for it incrementing by one, because the writer coalesces
