@@ -17,6 +17,7 @@
 #include <thread>
 #include <algorithm> // std::transform
 
+#include "beckhoff_ads_hardware_interface/ads_interface_utilities.hpp"
 #include "beckhoff_ads_hardware_interface/beckhoff_ads_hardware_interface.hpp"
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -1364,7 +1365,14 @@ namespace beckhoff_ads_hardware_interface
             std::string plc_ip = params.at("plc_ip_address");
             std::string plc_ams_net_id_str = params.at("plc_ams_net_id");
             std::string local_ams_net_id_str = params.at("local_ams_net_id");
-            uint16_t plc_ams_port = std::stoul(params.at("plc_ams_port"));
+            const utilities::AmsPortParseResult port_parse = utilities::parseAmsPort(params.at("plc_ams_port"));
+            if (!port_parse.valid)
+            {
+                RCLCPP_FATAL(getLogger(), "\tInvalid 'plc_ams_port' '%s': %s.",
+                             params.at("plc_ams_port").c_str(), port_parse.error.c_str());
+                return false;
+            }
+            uint16_t plc_ams_port = port_parse.port;
             plc_ip_address_ = plc_ip;
             plc_ams_net_id_str_ = plc_ams_net_id_str;
             plc_ams_port_ = plc_ams_port;
@@ -1422,8 +1430,7 @@ namespace beckhoff_ads_hardware_interface
 
     PLCType BeckhoffADSHardwareInterface::strToPlcType(const std::string &type_str_param)
     {
-        std::string type_str = type_str_param;
-        std::transform(type_str.begin(), type_str.end(), type_str.begin(), ::toupper);
+        std::string type_str = utilities::toUpperCopy(type_str_param);
 
         if (type_str == "LREAL")
             return PLCType::LREAL;
