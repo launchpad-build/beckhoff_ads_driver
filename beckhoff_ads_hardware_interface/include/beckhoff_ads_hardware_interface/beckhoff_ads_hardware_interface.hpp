@@ -61,6 +61,15 @@ namespace beckhoff_ads_hardware_interface
     ZERO,         // send zero; the right answer for a velocity or effort command
   };
 
+  // What produces the value packed for a write instruction on each cycle.
+  enum class WriteValueSource
+  {
+    CONTROLLER,         // a ros2_control command interface
+    HEARTBEAT,          // the interface's own link-liveness counter
+    SETPOINT_SEQUENCE,  // the per-write-cycle setpoint sequence number
+    SETPOINT_TIMESTAMP, // the steady-clock instant the packed setpoints describe
+  };
+
   // Describes each PLC item (array or single variable) for polling via sum commands.
   struct ADSDataLayout
   {
@@ -123,17 +132,23 @@ namespace beckhoff_ads_hardware_interface
     std::string command_interface_name;
     std::string fallback_state_interface_name; // The state interface name corresponding to the current command interface name
     CommandFallback fallback = CommandFallback::HOLD_LAST;
-    bool is_heartbeat = false; // value comes from the interface's own counter, not a controller
+    WriteValueSource source = WriteValueSource::CONTROLLER;
+    // Set on the first cycle this interface carried a command. Until then its fallback is
+    // the normal case, not a dropout, and it must not count as one.
     bool has_been_commanded = false;
-    // An unseeded field keeps its whole item out of the transmitted request.
+    // Set once this field of the write buffer holds a value something provided: a command,
+    // a fallback, or the interface's initial_value at configure. An unseeded field must
+    // never reach the PLC; its whole item is left out of the transmitted request.
     bool seeded = false;
     size_t layout_index = 0; // index of the owning layout in ads_item_layouts_write_
-    // Resolved once at configure so write() stays non-blocking. Null for the heartbeat.
+    // Resolved once at configure so write() never does a string lookup, takes a blocking
+    // wait or hits a throwing path on the control loop. Null for the synthetic sources.
     hardware_interface::CommandInterface::SharedPtr command_handle;
     hardware_interface::StateInterface::SharedPtr fallback_state_handle;
   };
 
-  // One whole decoded SUM-read sample.
+  // One whole decoded SUM-read sample, published atomically so a control cycle never
+  // mixes values from two different reads. The stamp tells consumers how old it is.
   struct ReadSample
   {
     std::vector<double> values; // one per read instruction, in instruction order
@@ -233,6 +248,14 @@ namespace beckhoff_ads_hardware_interface
 
     // Synthetic heartbeat name, never exported to ros2_control.
     static constexpr const char *HEARTBEAT_INTERFACE_NAME = "__ads_link_heartbeat";
+
+    /**
+     * @brief Classifies which source provides a write instruction's value
+     *
+     * @param interface_name The command interface name, real or synthetic
+     * @returns The source the packing loop draws the value from
+     */
+    static WriteValueSource classifyWriteValueSource(const std::string &interface_name);
 
     std::string heartbeat_symbol_;        // PLC symbol to beat on; empty disables the heartbeat
     uint32_t heartbeat_counter_{0};       // advanced in write(), so control-loop thread only
