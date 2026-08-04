@@ -519,6 +519,9 @@ namespace beckhoff_ads_hardware_interface
                     read_instruction.plc_type = layout.plc_type;
                     read_instruction.state_interface_name = interface_name;
                     read_instruction.state_handle = get_state_interface_handle(interface_name);
+                    const auto critical_it = layout.critical_policies_.find(interface_name);
+                    read_instruction.critical =
+                        (critical_it != layout.critical_policies_.end()) && critical_it->second;
 
                     // The state interfaces' names are ordered by ascending indexes of the PLC array thanks to layout.ros2_interfaces_ being a map
                     ads_read_instructions_.push_back(read_instruction);
@@ -532,6 +535,7 @@ namespace beckhoff_ads_hardware_interface
             // never allocates.
             const size_t instruction_count = ads_read_instructions_.size();
             last_decoded_values_.assign(instruction_count, std::numeric_limits<double>::quiet_NaN());
+            item_failure_start_.assign(instruction_count, std::nullopt);
             read_sample_buffer_.initialiseSlots(
                 [instruction_count](ReadSample &slot)
                 {
@@ -692,7 +696,7 @@ namespace beckhoff_ads_hardware_interface
         std::map<std::string, bool> processed_plc_symbols;
 
         auto init_ads_read_layout =
-            [&](const auto &type_state_interfaces_)
+            [&](const auto &type_state_interfaces_, const bool is_joint)
         {
             for (const auto &[name, descr] : type_state_interfaces_)
             {
@@ -723,6 +727,14 @@ namespace beckhoff_ads_hardware_interface
                 const bool interface_optional = descr.interface_info.parameters.count("optional") &&
                                                 descr.interface_info.parameters.at("optional") == "true";
 
+                bool interface_critical =
+                    is_joint && (descr.interface_info.name == hardware_interface::HW_IF_POSITION ||
+                                 descr.interface_info.name == hardware_interface::HW_IF_VELOCITY);
+                if (descr.interface_info.parameters.count("critical"))
+                {
+                    interface_critical = descr.interface_info.parameters.at("critical") == "true";
+                }
+
                 // If this is the first time we see this symbol, create the layout
                 if (processed_plc_symbols.find(plc_symbol) == processed_plc_symbols.end())
                 {
@@ -732,6 +744,7 @@ namespace beckhoff_ads_hardware_interface
                     layout.plc_type = strToPlcType(plc_type_str);
                     layout.ros2_interfaces_.emplace(std::make_pair(plc_index, name));
                     layout.optional = interface_optional;
+                    layout.critical_policies_.emplace(name, interface_critical);
 
                     if (layout.plc_type == PLCType::UNKNOWN || layout.plc_type == PLCType::STRING)
                     {
@@ -754,15 +767,16 @@ namespace beckhoff_ads_hardware_interface
 
                     // Add the interface name the layout
                     (*it).ros2_interfaces_.emplace(std::make_pair(plc_index, name));
+                    (*it).critical_policies_.emplace(name, interface_critical);
                     // a symbol is only skippable if every interface on it agrees
                     (*it).optional = (*it).optional && interface_optional;
                 }
             }
         };
 
-        init_ads_read_layout(joint_state_interfaces_);
-        init_ads_read_layout(gpio_state_interfaces_);
-        init_ads_read_layout(sensor_state_interfaces_);
+        init_ads_read_layout(joint_state_interfaces_, true);
+        init_ads_read_layout(gpio_state_interfaces_, false);
+        init_ads_read_layout(sensor_state_interfaces_, false);
     }
 
     void BeckhoffADSHardwareInterface::ads_write_layout_configure()
@@ -1118,6 +1132,7 @@ namespace beckhoff_ads_hardware_interface
             // that is absent or renamed must not deactivate the whole hardware component. Only an
             // outage that takes out every item is treated as a link failure.
             size_t items_failed = 0;
+            bool critical_item_faulted = false;
             for (size_t i = 0; i < ads_read_instructions_.size(); ++i)
             {
                 const auto &read_instruction = ads_read_instructions_[i];
@@ -1133,8 +1148,24 @@ namespace beckhoff_ads_hardware_interface
                                          read_instruction.state_interface_name.c_str(), item_error_code,
                                          adsErrorText(static_cast<long>(item_error_code)));
                     ++items_failed;
+                    const std::chrono::steady_clock::time_point item_now = std::chrono::steady_clock::now();
+                    if (!item_failure_start_[i])
+                    {
+                        item_failure_start_[i] = item_now;
+                    }
+                    if (read_instruction.critical &&
+                        item_now - *item_failure_start_[i] >= comms_outage_grace_)
+                    {
+                        RCLCPP_ERROR_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
+                                              "Critical state interface '%s' has been failing beyond the grace "
+                                              "window. Hard-faulting instead of freezing its feedback.",
+                                              read_instruction.state_interface_name.c_str());
+                        read_hard_fault_.store(true, std::memory_order_release);
+                        critical_item_faulted = true;
+                    }
                     continue;
                 }
+                item_failure_start_[i].reset();
 
                 const uint8_t *ptr_plc_element_current = ads_buffer_sum_read_response_.data() + read_instruction.read_buffer_offset_data;
                 last_decoded_values_[i] = decode_plc_element(read_instruction.plc_type, ptr_plc_element_current);
@@ -1154,7 +1185,8 @@ namespace beckhoff_ads_hardware_interface
                 sample.sequence = ++read_sample_sequence_;
                 read_sample_buffer_.publish();
 
-                if (!(outage_latches_ && read_hard_fault_.load(std::memory_order_acquire)))
+                if (!critical_item_faulted &&
+                    !(outage_latches_ && read_hard_fault_.load(std::memory_order_acquire)))
                 {
                     read_hard_fault_.store(false, std::memory_order_release);
                 }
