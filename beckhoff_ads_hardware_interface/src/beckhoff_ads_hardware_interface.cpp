@@ -283,6 +283,26 @@ namespace beckhoff_ads_hardware_interface
             read_staleness_timeout_ns_ = std::max(read_staleness_timeout_ns_, 3 * read_poll_period_ns_);
         }
 
+        // How long activation may wait for the first good sample. 0 = do not wait.
+        activation_first_sample_timeout_ = std::chrono::milliseconds(1000);
+        try
+        {
+            const auto activation_it = info_.hardware_parameters.find("activation_first_sample_timeout_ms");
+            if (activation_it != info_.hardware_parameters.end())
+            {
+                const double ms = std::stod(activation_it->second);
+                if (std::isfinite(ms) && ms >= 0.0)
+                {
+                    activation_first_sample_timeout_ = std::chrono::milliseconds(static_cast<long long>(ms));
+                }
+            }
+        }
+        catch (const std::exception &ex)
+        {
+            RCLCPP_WARN(getLogger(), "Invalid activation_first_sample_timeout_ms: %s. Using default 1000 ms.",
+                        ex.what());
+        }
+
         // Scheduling for the I/O threads. The defaults give both threads SCHED_FIFO at
         // priority 50; a deployment can lower, raise or disable that through the parameters.
         {
@@ -904,9 +924,44 @@ namespace beckhoff_ads_hardware_interface
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_activate(
         const rclcpp_lifecycle::State & /*previous_state*/)
     {
+        CallbackReturn result = CallbackReturn::SUCCESS;
+
         register_transaction_statistics();
+        read_samples_published_.store(0, std::memory_order_release);
         start_io_threads();
-        return CallbackReturn::SUCCESS;
+
+        // Controllers that sample state on activation must never see the pre-first-read NaNs.
+        if (num_items_read_ > 0 && activation_first_sample_timeout_.count() > 0)
+        {
+            const std::chrono::steady_clock::time_point deadline =
+                std::chrono::steady_clock::now() + activation_first_sample_timeout_;
+            while (result == CallbackReturn::SUCCESS &&
+                   read_samples_published_.load(std::memory_order_acquire) == 0)
+            {
+                if (read_hard_fault_.load(std::memory_order_acquire))
+                {
+                    RCLCPP_ERROR(getLogger(), "Activation failed: the ADS link faulted before the first sample.");
+                    result = CallbackReturn::FAILURE;
+                }
+                else if (std::chrono::steady_clock::now() >= deadline)
+                {
+                    RCLCPP_ERROR(getLogger(),
+                                 "Activation failed: no PLC sample arrived within %ld ms.",
+                                 static_cast<long>(activation_first_sample_timeout_.count()));
+                    result = CallbackReturn::FAILURE;
+                }
+                else
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            if (result != CallbackReturn::SUCCESS)
+            {
+                stop_io_threads();
+            }
+        }
+
+        return result;
     }
 
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_deactivate(
@@ -1199,6 +1254,7 @@ namespace beckhoff_ads_hardware_interface
                 sample.stamp = std::chrono::steady_clock::now();
                 sample.sequence = ++read_sample_sequence_;
                 read_sample_buffer_.publish();
+                read_samples_published_.fetch_add(1, std::memory_order_release);
 
                 if (!critical_item_faulted &&
                     !(outage_latches_ && read_hard_fault_.load(std::memory_order_acquire)))

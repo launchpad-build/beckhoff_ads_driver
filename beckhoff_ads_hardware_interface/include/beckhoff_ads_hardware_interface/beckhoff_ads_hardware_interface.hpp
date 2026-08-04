@@ -285,6 +285,12 @@ namespace beckhoff_ads_hardware_interface
     // paced reading is slower than the configured value.
     long long read_staleness_timeout_ns_{100000000};
 
+    // How long on_activate may wait for the first good sample before failing activation,
+    // so early read() calls never publish NaN into controllers that sample state when they
+    // activate. Overridable via activation_first_sample_timeout_ms; 0 skips the wait.
+    std::chrono::milliseconds activation_first_sample_timeout_{1000};
+    std::atomic<uint64_t> read_samples_published_{0}; // bumped by the reader on every publish
+
     // ========= PLC ==============================
 
     // PLC Type and Size Helpers
