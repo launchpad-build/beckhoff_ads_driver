@@ -792,7 +792,7 @@ namespace beckhoff_ads_hardware_interface
         std::map<std::string, bool> processed_plc_symbols;
 
         auto init_ads_write_layout =
-            [&](const auto &type_command_interfaces_)
+            [&](const auto &type_command_interfaces_, const bool is_joint)
         {
             for (const auto &[name, descr] : type_command_interfaces_)
             {
@@ -825,7 +825,22 @@ namespace beckhoff_ads_hardware_interface
                 {
                     fallback_str = descr.interface_info.parameters.at("command_fallback");
                 }
-                const CommandFallback fallback_policy = parseCommandFallback(fallback_str, name);
+                CommandFallback fallback_policy;
+                if (fallback_str.empty() && is_joint &&
+                    descr.interface_info.name == hardware_interface::HW_IF_VELOCITY)
+                {
+                    // Holding the last value on a velocity command keeps a dead controller's
+                    // feed-forward alive; zero is the safe default for a motion stream.
+                    fallback_policy = CommandFallback::ZERO;
+                    RCLCPP_INFO(getLogger(),
+                                "Joint velocity command interface '%s' defaults to a zero fallback. "
+                                "Set command_fallback to hold_last or mirror_state to override.",
+                                name.c_str());
+                }
+                else
+                {
+                    fallback_policy = parseCommandFallback(fallback_str, name);
+                }
                 const bool interface_optional = descr.interface_info.parameters.count("optional") &&
                                                 descr.interface_info.parameters.at("optional") == "true";
 
@@ -867,8 +882,8 @@ namespace beckhoff_ads_hardware_interface
             }
         };
 
-        init_ads_write_layout(joint_command_interfaces_);
-        init_ads_write_layout(gpio_command_interfaces_);
+        init_ads_write_layout(joint_command_interfaces_, true);
+        init_ads_write_layout(gpio_command_interfaces_, false);
 
         // The heartbeat is the interface's own liveness signal, not a controller's. Owning it
         // here is what makes it useful: it keeps advancing with no controller claiming
