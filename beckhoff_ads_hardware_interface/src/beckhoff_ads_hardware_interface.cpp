@@ -17,6 +17,7 @@
 #include <cstring> // std::memcpy
 #include <chrono>
 #include <thread>
+#include <tuple>
 #include <algorithm> // std::transform
 
 #include "beckhoff_ads_hardware_interface/ads_interface_utilities.hpp"
@@ -450,6 +451,7 @@ namespace beckhoff_ads_hardware_interface
                     read_instruction.read_buffer_offset_data = layout.offset_in_read_response_data + index * layout.plc_element_byte_size;
                     read_instruction.plc_type = layout.plc_type;
                     read_instruction.state_interface_name = interface_name;
+                    read_instruction.state_handle = get_state_interface_handle(interface_name);
 
                     // The state interfaces' names are ordered by ascending indexes of the PLC array thanks to layout.ros2_interfaces_ being a map
                     ads_read_instructions_.push_back(read_instruction);
@@ -537,6 +539,10 @@ namespace beckhoff_ads_hardware_interface
                     write_instruction.fallback_state_interface_name = "";
                     write_instruction.is_heartbeat = (interface_name == HEARTBEAT_INTERFACE_NAME);
                     write_instruction.layout_index = i;
+                    if (!write_instruction.is_heartbeat)
+                    {
+                        write_instruction.command_handle = get_command_interface_handle(interface_name);
+                    }
 
                     // What to send when a controller stops writing this interface. Holding the
                     // last value is what every stack has actually had, so it stays the default.
@@ -555,6 +561,7 @@ namespace beckhoff_ads_hardware_interface
                         if (state_it != layout.state_command_interfaces_map_.end())
                         {
                             write_instruction.fallback_state_interface_name = state_it->second;
+                            write_instruction.fallback_state_handle = get_state_interface_handle(state_it->second);
                         }
                         else
                         {
@@ -572,7 +579,8 @@ namespace beckhoff_ads_hardware_interface
                     }
                     else
                     {
-                        const double initial = get_command(interface_name);
+                        double initial = std::numeric_limits<double>::quiet_NaN();
+                        std::ignore = get_command(write_instruction.command_handle, initial, true);
                         if (std::isfinite(initial))
                         {
                             uint8_t *seed_destination = ads_buffer_sum_write_request_.data() +
@@ -820,8 +828,8 @@ namespace beckhoff_ads_hardware_interface
 
         for (size_t i = 0; i < ads_read_instructions_.size(); ++i)
         {
-            set_state(ads_read_instructions_[i].state_interface_name,
-                      polling_read_cache_[i].load(std::memory_order_acquire));
+            std::ignore = set_state(ads_read_instructions_[i].state_handle,
+                                    polling_read_cache_[i].load(std::memory_order_acquire), false);
         }
         return read_hard_fault_.load(std::memory_order_acquire)
                    ? hardware_interface::return_type::ERROR
@@ -1099,8 +1107,12 @@ namespace beckhoff_ads_hardware_interface
             }
 
             // store the current val and reset the ros-side command value
-            double val = get_command(write_instruction.command_interface_name);
-            set_command(write_instruction.command_interface_name, std::numeric_limits<double>::quiet_NaN());
+            double val = std::numeric_limits<double>::quiet_NaN();
+            if (get_command(write_instruction.command_handle, val, false))
+            {
+                std::ignore = set_command(write_instruction.command_handle,
+                                          std::numeric_limits<double>::quiet_NaN(), false);
+            }
 
             if (!std::isnan(val))
             {
@@ -1131,9 +1143,9 @@ namespace beckhoff_ads_hardware_interface
                     val = 0.0;
                 }
                 else if (write_instruction.fallback == CommandFallback::MIRROR_STATE &&
-                         !write_instruction.fallback_state_interface_name.empty())
+                         write_instruction.fallback_state_handle)
                 {
-                    val = get_state(write_instruction.fallback_state_interface_name);
+                    std::ignore = get_state(write_instruction.fallback_state_handle, val, false);
                 }
 
                 // Hold the last value: leave this field of the buffer alone, which keeps

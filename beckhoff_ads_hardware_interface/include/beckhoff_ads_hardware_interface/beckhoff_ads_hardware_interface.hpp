@@ -112,6 +112,9 @@ namespace beckhoff_ads_hardware_interface
     size_t read_buffer_offset_data;
     PLCType plc_type;
     std::string state_interface_name;
+    // Resolved once at configure so read() never does a string lookup, takes a blocking
+    // wait or hits a throwing path on the control loop.
+    hardware_interface::StateInterface::SharedPtr state_handle;
   };
 
   struct WriteInstruction
@@ -130,6 +133,10 @@ namespace beckhoff_ads_hardware_interface
     // never reach the PLC; its whole item is left out of the transmitted request.
     bool seeded = false;
     size_t layout_index = 0; // index of the owning layout in ads_item_layouts_write_
+    // Resolved once at configure so write() never does a string lookup, takes a blocking
+    // wait or hits a throwing path on the control loop. Null for the heartbeat.
+    hardware_interface::CommandInterface::SharedPtr command_handle;
+    hardware_interface::StateInterface::SharedPtr fallback_state_handle;
   };
 
   // The latest packed sum-write request handed from write() to the writer thread.
