@@ -703,6 +703,24 @@ namespace beckhoff_ads_hardware_interface
         return true;
     }
 
+    void BeckhoffADSHardwareInterface::warn_if_joint_motion_interface_is_32_bit(
+        const std::string &interface_name,
+        const hardware_interface::InterfaceDescription &description,
+        bool is_joint,
+        const std::string &plc_type_str)
+    {
+        const bool motion_interface =
+            is_joint && (description.interface_info.name == hardware_interface::HW_IF_POSITION ||
+                         description.interface_info.name == hardware_interface::HW_IF_VELOCITY);
+        if (motion_interface && utilities::toUpperCopy(plc_type_str) == "REAL")
+        {
+            RCLCPP_WARN(getLogger(),
+                        "Joint interface '%s' is declared as 32-bit REAL. A position or velocity "
+                        "stream loses precision through a float; declare it LREAL on the PLC and here.",
+                        interface_name.c_str());
+        }
+    }
+
     void BeckhoffADSHardwareInterface::ads_read_layout_configure()
     {
         // Count all state interfaces to pre-allocate memory once and avoid reallocations.
@@ -754,6 +772,8 @@ namespace beckhoff_ads_hardware_interface
                 {
                     interface_critical = descr.interface_info.parameters.at("critical") == "true";
                 }
+
+                warn_if_joint_motion_interface_is_32_bit(name, descr, is_joint, plc_type_str);
 
                 // If this is the first time we see this symbol, create the layout
                 if (processed_plc_symbols.find(plc_symbol) == processed_plc_symbols.end())
@@ -845,6 +865,8 @@ namespace beckhoff_ads_hardware_interface
                 {
                     fallback_str = descr.interface_info.parameters.at("command_fallback");
                 }
+                warn_if_joint_motion_interface_is_32_bit(name, descr, is_joint, plc_type_str);
+
                 CommandFallback fallback_policy;
                 if (fallback_str.empty() && is_joint &&
                     descr.interface_info.name == hardware_interface::HW_IF_VELOCITY)

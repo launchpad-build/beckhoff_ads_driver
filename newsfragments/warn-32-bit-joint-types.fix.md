@@ -1,0 +1,1 @@
+Configure now warns when a joint position or velocity interface declares a 32-bit REAL PLC type. A float carries roughly seven significant digits, so a millimetre-scale gantry position streamed through one quietly loses precision the control loop then chases; the warning names the interface and points at LREAL. (warn-32-bit-joint-types)

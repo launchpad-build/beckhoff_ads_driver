@@ -323,6 +323,20 @@ namespace beckhoff_ads_hardware_interface
     // freed device and segfault (seen on Ctrl-C teardown).
     void release_ads_handles();
 
+    /**
+     * @brief Warns when a joint position or velocity interface is declared as 32-bit REAL
+     *
+     * @param interface_name The full interface name, for the warning
+     * @param description The interface description holding the short interface name
+     * @param is_joint True when the interface belongs to a joint
+     * @param plc_type_str The declared PLC_type parameter text
+     */
+    void warn_if_joint_motion_interface_is_32_bit(
+        const std::string &interface_name,
+        const hardware_interface::InterfaceDescription &description,
+        bool is_joint,
+        const std::string &plc_type_str);
+
     // Metadata (populated in on interface export)
     // Describes each variable on the PLC
     std::vector<ADSDataLayout> ads_item_layouts_read_;
