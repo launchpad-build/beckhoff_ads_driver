@@ -77,6 +77,11 @@ if(BUILD_TESTING)
     test/test_interface_initial_value.cpp
   )
   target_link_libraries(test_interface_initial_value beckhoff_ads_hardware_interface)
+
+  ament_add_gtest(test_latest_sample_buffer
+    test/test_latest_sample_buffer.cpp
+  )
+  target_link_libraries(test_latest_sample_buffer beckhoff_ads_hardware_interface)
 endif()
 
 ament_package()

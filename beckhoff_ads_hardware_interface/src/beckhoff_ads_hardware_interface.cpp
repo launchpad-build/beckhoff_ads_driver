@@ -405,7 +405,8 @@ namespace beckhoff_ads_hardware_interface
         // resized to the current layout count, so an instruction surviving from a cycle that
         // resolved more symbols carried an offset past the end of the smaller buffer.
         ads_read_instructions_.clear();
-        polling_read_cache_.clear();
+        last_decoded_values_.clear();
+        read_sample_sequence_ = 0;
         ads_buffer_sum_read_request_.clear();
         ads_buffer_sum_read_response_.clear();
 
@@ -460,13 +461,18 @@ namespace beckhoff_ads_hardware_interface
                 current_data_offset += header.NumBytesData;
                 current_error_offset += sizeof(uint32_t);
             }
-            // One cache slot per read instruction for the reader thread. Default to NaN so read()
-            // reports "no sample yet" until the first SUM read completes. A deque keeps each slot's
-            // address stable; std::atomic<double> is neither copyable nor movable.
-            for (size_t i = 0; i < ads_read_instructions_.size(); ++i)
-            {
-                polling_read_cache_.emplace_back(std::numeric_limits<double>::quiet_NaN());
-            }
+            // Default to NaN so read() reports "no sample yet" until the first SUM read
+            // completes. All three snapshot slots are pre-sized here so the reader thread
+            // never allocates.
+            const size_t instruction_count = ads_read_instructions_.size();
+            last_decoded_values_.assign(instruction_count, std::numeric_limits<double>::quiet_NaN());
+            read_sample_buffer_.initialiseSlots(
+                [instruction_count](ReadSample &slot)
+                {
+                    slot.values.assign(instruction_count, std::numeric_limits<double>::quiet_NaN());
+                    slot.stamp = std::chrono::steady_clock::time_point{};
+                    slot.sequence = 0;
+                });
 
             RCLCPP_INFO(getLogger(), "ADS Sum READ configured for %zu items. Request: %zu bytes, Response: %zu bytes.",
                         num_items_read_, ads_buffer_sum_read_request_.size(), ads_buffer_sum_read_response_.size());
@@ -819,18 +825,30 @@ namespace beckhoff_ads_hardware_interface
     hardware_interface::return_type BeckhoffADSHardwareInterface::read(
         const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
     {
-        // The reader thread performs the SUM read off the control loop and decodes into
-        // polling_read_cache_. Here we only publish the latest cached values.
+        // The reader thread performs the SUM read off the control loop and publishes whole
+        // decoded samples. Here we only take the latest sample and copy it out, so every
+        // state interface comes from the same read and never from a mix of two.
         if (num_items_read_ == 0)
         {
             return hardware_interface::return_type::OK;
         }
 
+        read_sample_buffer_.refreshReadSlot();
+        const ReadSample &sample = read_sample_buffer_.readSlot();
+
         for (size_t i = 0; i < ads_read_instructions_.size(); ++i)
         {
-            std::ignore = set_state(ads_read_instructions_[i].state_handle,
-                                    polling_read_cache_[i].load(std::memory_order_acquire), false);
+            std::ignore = set_state(ads_read_instructions_[i].state_handle, sample.values[i], false);
         }
+
+        stat_read_sample_age_ms_ =
+            (sample.sequence > 0)
+                ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - sample.stamp)
+                          .count() *
+                      1e-6
+                : std::numeric_limits<double>::quiet_NaN();
+
         return read_hard_fault_.load(std::memory_order_acquire)
                    ? hardware_interface::return_type::ERROR
                    : hardware_interface::return_type::OK;
@@ -919,6 +937,7 @@ namespace beckhoff_ads_hardware_interface
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_fallback_activations_per_cycle", &stat_fallback_activations_per_cycle_);
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_never_commanded_interfaces", &stat_never_commanded_interfaces_);
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_heartbeat", &stat_heartbeat_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_read_sample_age_ms", &stat_read_sample_age_ms_);
     }
 
     void BeckhoffADSHardwareInterface::record_read_failure()
@@ -1034,8 +1053,7 @@ namespace beckhoff_ads_hardware_interface
                 }
 
                 const uint8_t *ptr_plc_element_current = ads_buffer_sum_read_response_.data() + read_instruction.read_buffer_offset_data;
-                polling_read_cache_[i].store(decode_plc_element(read_instruction.plc_type, ptr_plc_element_current),
-                                             std::memory_order_release);
+                last_decoded_values_[i] = decode_plc_element(read_instruction.plc_type, ptr_plc_element_current);
             }
 
             if (items_failed == ads_read_instructions_.size() && !ads_read_instructions_.empty())
@@ -1046,6 +1064,12 @@ namespace beckhoff_ads_hardware_interface
             }
             else
             {
+                ReadSample &sample = read_sample_buffer_.writeSlot();
+                sample.values = last_decoded_values_;
+                sample.stamp = std::chrono::steady_clock::now();
+                sample.sequence = ++read_sample_sequence_;
+                read_sample_buffer_.publish();
+
                 read_hard_fault_.store(false, std::memory_order_release);
                 // Declare recovery only after the link has been good for a stable period, so a
                 // flapping link logs one outage instead of an error/recovery pair per cycle.

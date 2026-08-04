@@ -15,7 +15,6 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <deque>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -137,6 +136,15 @@ namespace beckhoff_ads_hardware_interface
     // wait or hits a throwing path on the control loop. Null for the heartbeat.
     hardware_interface::CommandInterface::SharedPtr command_handle;
     hardware_interface::StateInterface::SharedPtr fallback_state_handle;
+  };
+
+  // One whole decoded SUM-read sample, published atomically so a control cycle never
+  // mixes values from two different reads. The stamp tells consumers how old it is.
+  struct ReadSample
+  {
+    std::vector<double> values; // one per read instruction, in instruction order
+    std::chrono::steady_clock::time_point stamp{};
+    uint64_t sequence = 0; // 0 means no sample has been published yet
   };
 
   // The latest packed sum-write request handed from write() to the writer thread.
@@ -371,6 +379,7 @@ namespace beckhoff_ads_hardware_interface
     double stat_fallback_activations_per_cycle_{0.0};
     double stat_never_commanded_interfaces_{0.0};
     double stat_heartbeat_{0.0};
+    double stat_read_sample_age_ms_{0.0}; // age of the sample read() last published; control loop only
 
     std::vector<ReadInstruction> ads_read_instructions_;
     std::vector<WriteInstruction> ads_write_instructions_;
@@ -404,7 +413,11 @@ namespace beckhoff_ads_hardware_interface
     std::thread read_thread_;
     std::atomic<bool> read_stop_{false};
     std::atomic<bool> read_hard_fault_{false};      // outage outlived the grace window, surfaced by read()
-    std::deque<std::atomic<double>> polling_read_cache_; // one slot per read instruction; deque keeps addresses stable
+    // Whole-sample hand-over from the reader thread to read(). The reader keeps its own
+    // last-good values so a per-item failure holds that item while the rest stay live.
+    utilities::LatestSampleBuffer<ReadSample> read_sample_buffer_;
+    std::vector<double> last_decoded_values_; // reader thread only
+    uint64_t read_sample_sequence_ = 0;       // reader thread only
     long long read_poll_period_ns_ = 0;             // optional pacing between SUM reads; 0 = unpaced
     // Consecutive failed SUM-read round-trips, for outage and recovery logs. Reader thread only.
     size_t read_consecutive_failures_ = 0;
