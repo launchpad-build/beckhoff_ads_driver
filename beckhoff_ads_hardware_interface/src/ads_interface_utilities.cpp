@@ -54,6 +54,127 @@ namespace utilities
     return result;
   }
 
+  namespace
+  {
+    bool parseSchedulingPolicy(const std::string &policy_text, SchedulingPolicy &policy)
+    {
+      bool result = true;
+      if (policy_text.empty() || policy_text == "fifo")
+      {
+        policy = SchedulingPolicy::FIFO;
+      }
+      else if (policy_text == "rr")
+      {
+        policy = SchedulingPolicy::ROUND_ROBIN;
+      }
+      else if (policy_text == "other")
+      {
+        policy = SchedulingPolicy::OTHER;
+      }
+      else if (policy_text == "inherit")
+      {
+        policy = SchedulingPolicy::INHERIT;
+      }
+      else
+      {
+        result = false;
+      }
+      return result;
+    }
+
+    bool parseCpuList(const std::string &affinity_text, std::vector<unsigned int> &cpus)
+    {
+      bool result = true;
+      size_t start = 0;
+      while (result && start <= affinity_text.size() && !affinity_text.empty())
+      {
+        const size_t comma = affinity_text.find(',', start);
+        const std::string token = affinity_text.substr(
+            start, comma == std::string::npos ? std::string::npos : comma - start);
+        try
+        {
+          size_t consumed = 0;
+          const unsigned long cpu = std::stoul(token, &consumed);
+          if (consumed != token.size() || cpu > 1023)
+          {
+            result = false;
+          }
+          else
+          {
+            cpus.push_back(static_cast<unsigned int>(cpu));
+          }
+        }
+        catch (const std::exception &)
+        {
+          result = false;
+        }
+        if (comma == std::string::npos)
+        {
+          break;
+        }
+        start = comma + 1;
+      }
+      return result;
+    }
+  } // namespace
+
+  ThreadSchedulingParseResult parseThreadScheduling(
+      const std::string &policy_text,
+      const std::string &priority_text,
+      const std::string &affinity_text)
+  {
+    ThreadSchedulingParseResult result;
+
+    if (!parseSchedulingPolicy(policy_text, result.config.policy))
+    {
+      result.valid = false;
+      result.error = "unknown policy '" + policy_text + "', expected fifo, rr, other or inherit";
+    }
+
+    const bool real_time = result.config.policy == SchedulingPolicy::FIFO ||
+                           result.config.policy == SchedulingPolicy::ROUND_ROBIN;
+    if (result.valid && !real_time)
+    {
+      result.config.priority = 0;
+    }
+    if (result.valid && real_time && !priority_text.empty())
+    {
+      try
+      {
+        size_t consumed = 0;
+        const int priority = std::stoi(priority_text, &consumed);
+        if (consumed != priority_text.size() || priority < 1 || priority > 99)
+        {
+          result.valid = false;
+          result.error = "priority '" + priority_text + "' outside 1 to 99";
+        }
+        else
+        {
+          result.config.priority = priority;
+        }
+      }
+      catch (const std::exception &)
+      {
+        result.valid = false;
+        result.error = "priority '" + priority_text + "' is not a number";
+      }
+    }
+
+    if (result.valid && !affinity_text.empty() &&
+        !parseCpuList(affinity_text, result.config.cpu_affinity))
+    {
+      result.valid = false;
+      result.error = "affinity '" + affinity_text + "' is not a comma-separated CPU list";
+    }
+
+    if (!result.valid)
+    {
+      result.config = ThreadSchedulingConfig{};
+    }
+
+    return result;
+  }
+
   void compactSumWriteRequest(
       const std::vector<uint8_t> &full_request,
       const std::vector<SumWriteItemSpan> &spans,

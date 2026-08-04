@@ -84,6 +84,54 @@ namespace utilities
       std::vector<size_t> &included_indices);
 
   /**
+   * @brief Scheduling policy for the I/O threads
+   */
+  enum class SchedulingPolicy
+  {
+    INHERIT,     // leave the thread as created
+    FIFO,        // SCHED_FIFO real-time scheduling
+    ROUND_ROBIN, // SCHED_RR real-time scheduling
+    OTHER,       // SCHED_OTHER, the normal time-sharing policy
+  };
+
+  /**
+   * @brief Scheduling configuration applied to both I/O threads
+   */
+  struct ThreadSchedulingConfig
+  {
+    SchedulingPolicy policy{SchedulingPolicy::FIFO};
+    int priority{50};
+    std::vector<unsigned int> cpu_affinity;
+  };
+
+  /**
+   * @brief Outcome of parsing the I/O thread scheduling parameters
+   */
+  struct ThreadSchedulingParseResult
+  {
+    bool valid{true};
+    ThreadSchedulingConfig config;
+    std::string error;
+  };
+
+  /**
+   * @brief Parses the I/O thread scheduling hardware parameters
+   *
+   * Empty texts keep the defaults: SCHED_FIFO at priority 50 with no CPU
+   * pinning. A real-time priority must lie in 1 to 99; inherit and other
+   * take no priority. The affinity text is a comma-separated CPU list.
+   *
+   * @param policy_text One of fifo, rr, other or inherit, or empty for the default
+   * @param priority_text The real-time priority, or empty for the default
+   * @param affinity_text Comma-separated CPU indices, or empty for no pinning
+   * @returns ThreadSchedulingParseResult with the configuration, or an error description
+   */
+  ThreadSchedulingParseResult parseThreadScheduling(
+      const std::string &policy_text,
+      const std::string &priority_text,
+      const std::string &affinity_text);
+
+  /**
    * @brief Wait-free latest-value hand-over between one writer and one reader
    *
    * Classic triple buffer: the writer always owns one slot, the reader always

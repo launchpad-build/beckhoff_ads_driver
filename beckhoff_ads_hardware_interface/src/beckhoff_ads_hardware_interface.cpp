@@ -18,6 +18,9 @@
 #include <chrono>
 #include <thread>
 #include <tuple>
+
+#include <pthread.h>
+#include <sched.h>
 #include <algorithm> // std::transform
 
 #include "beckhoff_ads_hardware_interface/ads_interface_utilities.hpp"
@@ -235,6 +238,26 @@ namespace beckhoff_ads_hardware_interface
         {
             RCLCPP_WARN(getLogger(), "Invalid comms_outage_grace_ms: %s. Using default %ld ms.",
                         ex.what(), static_cast<long>(comms_outage_grace_.count()));
+        }
+
+        // Scheduling for the I/O threads. The defaults give both threads SCHED_FIFO at
+        // priority 50; a deployment can lower, raise or disable that through the parameters.
+        {
+            auto param_or_empty = [this](const char *key) -> std::string
+            {
+                const auto it = info_.hardware_parameters.find(key);
+                return (it != info_.hardware_parameters.end()) ? it->second : std::string{};
+            };
+            const utilities::ThreadSchedulingParseResult scheduling_parse =
+                utilities::parseThreadScheduling(param_or_empty("io_thread_scheduling_policy"),
+                                                 param_or_empty("io_thread_priority"),
+                                                 param_or_empty("io_thread_cpu_affinity"));
+            if (!scheduling_parse.valid)
+            {
+                RCLCPP_WARN(getLogger(), "Invalid I/O thread scheduling parameters: %s. Using the defaults.",
+                            scheduling_parse.error.c_str());
+            }
+            io_thread_scheduling_ = scheduling_parse.config;
         }
 
         // Optional link heartbeat. The PLC watches this counter for movement, so it can tell
@@ -1385,12 +1408,65 @@ namespace beckhoff_ads_hardware_interface
                 write_pending_ = false;
             }
             write_thread_ = std::thread(&BeckhoffADSHardwareInterface::writer_loop, this);
+            apply_io_thread_scheduling(write_thread_, "ADS writer");
         }
 
         if (num_items_read_ > 0 && !read_thread_.joinable())
         {
             read_stop_.store(false, std::memory_order_release);
             read_thread_ = std::thread(&BeckhoffADSHardwareInterface::reader_loop, this);
+            apply_io_thread_scheduling(read_thread_, "ADS reader");
+        }
+    }
+
+    void BeckhoffADSHardwareInterface::apply_io_thread_scheduling(std::thread &thread, const char *thread_name)
+    {
+        if (io_thread_scheduling_.policy != utilities::SchedulingPolicy::INHERIT)
+        {
+            int native_policy = SCHED_OTHER;
+            if (io_thread_scheduling_.policy == utilities::SchedulingPolicy::FIFO)
+            {
+                native_policy = SCHED_FIFO;
+            }
+            else if (io_thread_scheduling_.policy == utilities::SchedulingPolicy::ROUND_ROBIN)
+            {
+                native_policy = SCHED_RR;
+            }
+            sched_param scheduling_parameters{};
+            scheduling_parameters.sched_priority = io_thread_scheduling_.priority;
+            const int scheduling_error =
+                pthread_setschedparam(thread.native_handle(), native_policy, &scheduling_parameters);
+            if (scheduling_error != 0)
+            {
+                RCLCPP_WARN(getLogger(),
+                            "Could not set the %s thread scheduling (policy %d, priority %d): %s. "
+                            "The thread keeps normal scheduling; grant the process CAP_SYS_NICE or an "
+                            "rtprio limit, or set io_thread_scheduling_policy to inherit.",
+                            thread_name, native_policy, io_thread_scheduling_.priority,
+                            std::strerror(scheduling_error));
+            }
+            else
+            {
+                RCLCPP_INFO(getLogger(), "%s thread scheduling set: policy %d, priority %d.",
+                            thread_name, native_policy, io_thread_scheduling_.priority);
+            }
+        }
+
+        if (!io_thread_scheduling_.cpu_affinity.empty())
+        {
+            cpu_set_t cpu_set;
+            CPU_ZERO(&cpu_set);
+            for (const unsigned int cpu : io_thread_scheduling_.cpu_affinity)
+            {
+                CPU_SET(cpu, &cpu_set);
+            }
+            const int affinity_error =
+                pthread_setaffinity_np(thread.native_handle(), sizeof(cpu_set), &cpu_set);
+            if (affinity_error != 0)
+            {
+                RCLCPP_WARN(getLogger(), "Could not set the %s thread CPU affinity: %s.",
+                            thread_name, std::strerror(affinity_error));
+            }
         }
     }
 

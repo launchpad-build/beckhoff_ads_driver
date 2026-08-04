@@ -42,6 +42,48 @@ TEST(ParseAmsPort, RejectsZeroAndMalformedInput)
   EXPECT_FALSE(utilities::parseAmsPort("-1").valid);
 }
 
+TEST(ParseThreadScheduling, EmptyInputsYieldFifoAtPriorityFifty)
+{
+  const utilities::ThreadSchedulingParseResult result = utilities::parseThreadScheduling("", "", "");
+  EXPECT_TRUE(result.valid);
+  EXPECT_EQ(result.config.policy, utilities::SchedulingPolicy::FIFO);
+  EXPECT_EQ(result.config.priority, 50);
+  EXPECT_TRUE(result.config.cpu_affinity.empty());
+}
+
+TEST(ParseThreadScheduling, AcceptsEveryPolicyName)
+{
+  EXPECT_EQ(utilities::parseThreadScheduling("fifo", "", "").config.policy,
+            utilities::SchedulingPolicy::FIFO);
+  EXPECT_EQ(utilities::parseThreadScheduling("rr", "", "").config.policy,
+            utilities::SchedulingPolicy::ROUND_ROBIN);
+  EXPECT_EQ(utilities::parseThreadScheduling("other", "", "").config.policy,
+            utilities::SchedulingPolicy::OTHER);
+  EXPECT_EQ(utilities::parseThreadScheduling("inherit", "", "").config.policy,
+            utilities::SchedulingPolicy::INHERIT);
+  EXPECT_FALSE(utilities::parseThreadScheduling("realtime", "", "").valid);
+}
+
+TEST(ParseThreadScheduling, ValidatesTheRealTimePriorityRange)
+{
+  EXPECT_EQ(utilities::parseThreadScheduling("fifo", "80", "").config.priority, 80);
+  EXPECT_FALSE(utilities::parseThreadScheduling("fifo", "0", "").valid);
+  EXPECT_FALSE(utilities::parseThreadScheduling("fifo", "100", "").valid);
+  EXPECT_FALSE(utilities::parseThreadScheduling("fifo", "high", "").valid);
+  EXPECT_EQ(utilities::parseThreadScheduling("other", "", "").config.priority, 0);
+  EXPECT_EQ(utilities::parseThreadScheduling("inherit", "", "").config.priority, 0);
+}
+
+TEST(ParseThreadScheduling, ParsesTheCpuAffinityList)
+{
+  const utilities::ThreadSchedulingParseResult result =
+      utilities::parseThreadScheduling("fifo", "50", "0,2,3");
+  EXPECT_TRUE(result.valid);
+  EXPECT_EQ(result.config.cpu_affinity, (std::vector<unsigned int>{0, 2, 3}));
+  EXPECT_FALSE(utilities::parseThreadScheduling("fifo", "50", "0,two").valid);
+  EXPECT_FALSE(utilities::parseThreadScheduling("fifo", "50", ",").valid);
+}
+
 TEST(ToUpperCopy, UpperCasesPlainAscii)
 {
   EXPECT_EQ(utilities::toUpperCopy("lreal"), "LREAL");

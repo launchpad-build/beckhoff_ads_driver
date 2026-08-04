@@ -392,6 +392,23 @@ namespace beckhoff_ads_hardware_interface
     void start_io_threads(); // spawns the writer and reader threads
     void stop_io_threads();  // signals and joins both worker threads; safe to call when idle
 
+    /**
+     * @brief Applies the configured scheduling policy, priority and affinity to a thread
+     *
+     * Failures are warned about and left non-fatal, so a process without the
+     * real-time capability still runs with normal scheduling.
+     *
+     * @param thread The I/O thread to reschedule
+     * @param thread_name Human-readable thread name for the log messages
+     */
+    void apply_io_thread_scheduling(std::thread &thread, const char *thread_name);
+
+    // Scheduling applied to both I/O threads. Defaults to SCHED_FIFO at priority 50, so a
+    // wake after the write notify is not at the mercy of time-sharing. Overridable through
+    // the io_thread_scheduling_policy, io_thread_priority and io_thread_cpu_affinity
+    // hardware parameters; policy inherit restores plain std::thread behaviour.
+    utilities::ThreadSchedulingConfig io_thread_scheduling_;
+
     // Writer thread: owns the SUM-write round-trip. write() marshals the latest command
     // buffer, hands it over here, and returns. Only the newest buffer is sent (coalescing).
     void writer_loop();
