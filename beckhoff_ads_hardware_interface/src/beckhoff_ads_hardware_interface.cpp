@@ -1309,6 +1309,7 @@ namespace beckhoff_ads_hardware_interface
 
         uint64_t fallbacks_this_cycle = 0;
         uint64_t never_commanded_this_cycle = 0;
+        const char *first_fallback_interface = nullptr;
 
         std::fill(write_layout_seeded_.begin(), write_layout_seeded_.end(), 1);
 
@@ -1348,10 +1349,10 @@ namespace beckhoff_ads_hardware_interface
                 {
                     ++fallbacks_this_cycle;
                     fallback_activations_.fetch_add(1, std::memory_order_relaxed);
-                    RCLCPP_WARN_THROTTLE(getLogger(), *logging_throttle_clock_, 5000,
-                                         "Command interface '%s' carried no command this cycle after having been "
-                                         "commanded before. Applying its fallback.",
-                                         write_instruction.command_interface_name.c_str());
+                    if (first_fallback_interface == nullptr)
+                    {
+                        first_fallback_interface = write_instruction.command_interface_name.c_str();
+                    }
                 }
                 else
                 {
@@ -1389,6 +1390,14 @@ namespace beckhoff_ads_hardware_interface
                 return hardware_interface::return_type::ERROR;
             }
             write_instruction.seeded = true;
+        }
+
+        if (first_fallback_interface != nullptr)
+        {
+            RCLCPP_WARN_THROTTLE(getLogger(), *logging_throttle_clock_, 5000,
+                                 "%lu command interfaces carried no command this cycle after having been "
+                                 "commanded before ('%s' among them). Applying their fallbacks.",
+                                 static_cast<unsigned long>(fallbacks_this_cycle), first_fallback_interface);
         }
 
         fallback_activations_cycle_.store(fallbacks_this_cycle, std::memory_order_relaxed);
