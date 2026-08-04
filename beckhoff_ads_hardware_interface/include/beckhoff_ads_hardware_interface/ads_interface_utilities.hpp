@@ -10,6 +10,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -130,6 +131,50 @@ namespace utilities
       const std::string &policy_text,
       const std::string &priority_text,
       const std::string &affinity_text);
+
+  /**
+   * @brief Monotonically increasing sequence counter for streamed setpoints
+   *
+   * Matches PLC UDINT arithmetic: the value wraps at the 32-bit boundary
+   * rather than saturating, and the consumer handles the wrap.
+   */
+  class SetpointSequenceCounter
+  {
+  public:
+    SetpointSequenceCounter() = default;
+
+    /**
+     * @brief Creates a counter continuing from the given value
+     *
+     * @param start The value the counter holds before the first advance
+     */
+    explicit SetpointSequenceCounter(uint32_t start);
+
+    /**
+     * @brief Advances the counter by one write cycle
+     *
+     * @returns The sequence value describing the current write cycle
+     */
+    uint32_t next();
+
+    /**
+     * @brief Reads the counter without advancing it
+     *
+     * @returns The sequence value returned by the most recent advance
+     */
+    uint32_t current() const;
+
+  private:
+    uint32_t value_{0};
+  };
+
+  /**
+   * @brief Converts a steady-clock instant to seconds as a PLC LREAL carries them
+   *
+   * @param instant The steady-clock instant to convert
+   * @returns Seconds since the steady-clock epoch, with the fractional part kept
+   */
+  double monotonicSeconds(const std::chrono::steady_clock::time_point &instant);
 
   /**
    * @brief Wait-free latest-value hand-over between one writer and one reader
