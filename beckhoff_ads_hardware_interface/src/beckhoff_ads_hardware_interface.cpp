@@ -1770,6 +1770,29 @@ namespace beckhoff_ads_hardware_interface
             bhf::ads::SetLocalAddress(local_net_id);
             ads_read_device_ = std::make_unique<AdsDevice>(plc_ip, remote_net_id, plc_ams_port);
             ads_write_device_ = std::make_unique<AdsDevice>(plc_ip, remote_net_id, plc_ams_port);
+
+            // A blocking ADS call bounds how long stop_io_threads and outage detection can
+            // stall, so the default request timeout drops from the library's 5000 ms to a
+            // small multiple of a healthy round trip. 0 keeps the library default.
+            uint32_t request_timeout_ms = 100;
+            const auto timeout_it = params.find("ads_request_timeout_ms");
+            if (timeout_it != params.end())
+            {
+                try
+                {
+                    const double ms = std::stod(timeout_it->second);
+                    request_timeout_ms = (std::isfinite(ms) && ms >= 0.0) ? static_cast<uint32_t>(ms) : 100;
+                }
+                catch (const std::exception &ex)
+                {
+                    RCLCPP_WARN(getLogger(), "Invalid ads_request_timeout_ms: %s. Using default 100 ms.", ex.what());
+                }
+            }
+            if (request_timeout_ms > 0)
+            {
+                ads_read_device_->SetTimeout(request_timeout_ms);
+                ads_write_device_->SetTimeout(request_timeout_ms);
+            }
             RCLCPP_INFO(getLogger(), "\tTimeout is: %u", ads_read_device_->GetTimeout());
 
             RCLCPP_INFO(getLogger(), "\tADS Devices configured for PLC: %s, Port: %u", plc_ip.c_str(), plc_ams_port);
