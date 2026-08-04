@@ -87,9 +87,16 @@ namespace beckhoff_ads_hardware_interface
     // For interfaces targeting the same PLC symbol, store all their names with their corresponding index inside a map. This will be useful when calling thr ROS2 set_state and set_command functions.
     std::map<size_t, std::string> ros2_interfaces_;
 
+    // Per-interface command_fallback, parsed from the interface parameters.
     std::map<std::string, CommandFallback> fallback_policies_;
 
-    // True only when every interface on this symbol declared optional="true".
+    // Per state interface: a critical item failing beyond the grace window is a hard fault
+    // instead of freezing silently. Joint position and velocity default to critical; the
+    // critical interface parameter overrides either way.
+    std::map<std::string, bool> critical_policies_;
+
+    // True when every interface on this symbol declared optional="true". An optional symbol
+    // the PLC does not have is dropped with a warning; a required one fails configure.
     bool optional = false;
     bool handle_resolved = false;
   };
@@ -110,6 +117,9 @@ namespace beckhoff_ads_hardware_interface
     std::string state_interface_name;
     // Resolved once at configure so read() stays non-blocking on the control loop.
     hardware_interface::StateInterface::SharedPtr state_handle;
+    // A critical item whose per-item read keeps failing beyond the grace window hard-faults
+    // the component; a non-critical one holds its last value and logs, as before.
+    bool critical = false;
   };
 
   struct WriteInstruction
@@ -396,6 +406,8 @@ namespace beckhoff_ads_hardware_interface
     utilities::LatestSampleBuffer<ReadSample> read_sample_buffer_;
     std::vector<double> last_decoded_values_; // reader thread only
     uint64_t read_sample_sequence_ = 0;       // reader thread only
+    // When each item's current per-item failure streak began; reader thread only.
+    std::vector<std::optional<std::chrono::steady_clock::time_point>> item_failure_start_;
     long long read_poll_period_ns_ = 0;             // optional pacing between SUM reads; 0 = unpaced
     // Consecutive failed SUM-read round-trips, for outage and recovery logs. Reader thread only.
     size_t read_consecutive_failures_ = 0;
