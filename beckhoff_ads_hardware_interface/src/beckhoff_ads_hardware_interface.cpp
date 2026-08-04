@@ -334,6 +334,23 @@ namespace beckhoff_ads_hardware_interface
             RCLCPP_INFO(getLogger(), "ADS link heartbeat enabled on PLC symbol '%s'.", heartbeat_symbol_.c_str());
         }
 
+        setpoint_sequence_symbol_.clear();
+        const auto sequence_it = info_.hardware_parameters.find("setpoint_sequence_plc_symbol");
+        if (sequence_it != info_.hardware_parameters.end() && !sequence_it->second.empty())
+        {
+            setpoint_sequence_symbol_ = sequence_it->second;
+            RCLCPP_INFO(getLogger(), "Setpoint sequence enabled on PLC symbol '%s'.",
+                        setpoint_sequence_symbol_.c_str());
+        }
+        setpoint_timestamp_symbol_.clear();
+        const auto stamp_it = info_.hardware_parameters.find("setpoint_time_plc_symbol");
+        if (stamp_it != info_.hardware_parameters.end() && !stamp_it->second.empty())
+        {
+            setpoint_timestamp_symbol_ = stamp_it->second;
+            RCLCPP_INFO(getLogger(), "Setpoint timestamp enabled on PLC symbol '%s'.",
+                        setpoint_timestamp_symbol_.c_str());
+        }
+
         // Configure ADS Client Device
         if (!configure_ads_device())
         {
@@ -933,14 +950,30 @@ namespace beckhoff_ads_hardware_interface
         // both of which a controller-written counter would sail straight through.
         if (!heartbeat_symbol_.empty())
         {
-            ADSDataLayout layout;
-            layout.plc_name_symbolic = heartbeat_symbol_;
-            layout.num_elements = 1;
-            layout.plc_type = PLCType::UDINT;
-            layout.plc_element_byte_size = plcTypeByteSize(PLCType::UDINT);
-            layout.ros2_interfaces_.emplace(0, HEARTBEAT_INTERFACE_NAME);
-            ads_item_layouts_write_.push_back(std::move(layout));
+            append_synthetic_write_layout(heartbeat_symbol_, PLCType::UDINT, HEARTBEAT_INTERFACE_NAME);
         }
+        if (!setpoint_sequence_symbol_.empty())
+        {
+            append_synthetic_write_layout(setpoint_sequence_symbol_, PLCType::UDINT,
+                                          SETPOINT_SEQUENCE_INTERFACE_NAME);
+        }
+        if (!setpoint_timestamp_symbol_.empty())
+        {
+            append_synthetic_write_layout(setpoint_timestamp_symbol_, PLCType::LREAL,
+                                          SETPOINT_TIMESTAMP_INTERFACE_NAME);
+        }
+    }
+
+    void BeckhoffADSHardwareInterface::append_synthetic_write_layout(
+        const std::string &plc_symbol, PLCType plc_type, const char *interface_name)
+    {
+        ADSDataLayout layout;
+        layout.plc_name_symbolic = plc_symbol;
+        layout.num_elements = 1;
+        layout.plc_type = plc_type;
+        layout.plc_element_byte_size = plcTypeByteSize(plc_type);
+        layout.ros2_interfaces_.emplace(0, interface_name);
+        ads_item_layouts_write_.push_back(std::move(layout));
     }
 
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_activate(
@@ -1080,6 +1113,14 @@ namespace beckhoff_ads_hardware_interface
         {
             result = WriteValueSource::HEARTBEAT;
         }
+        else if (interface_name == SETPOINT_SEQUENCE_INTERFACE_NAME)
+        {
+            result = WriteValueSource::SETPOINT_SEQUENCE;
+        }
+        else if (interface_name == SETPOINT_TIMESTAMP_INTERFACE_NAME)
+        {
+            result = WriteValueSource::SETPOINT_TIMESTAMP;
+        }
         return result;
     }
 
@@ -1126,6 +1167,7 @@ namespace beckhoff_ads_hardware_interface
         stat_never_commanded_interfaces_ =
             static_cast<double>(never_commanded_interfaces_.load(std::memory_order_relaxed));
         stat_heartbeat_ = static_cast<double>(heartbeat_counter_);
+        stat_setpoint_sequence_ = static_cast<double>(setpoint_sequence_counter_.current());
     }
 
     void BeckhoffADSHardwareInterface::register_transaction_statistics()
@@ -1143,6 +1185,7 @@ namespace beckhoff_ads_hardware_interface
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_fallback_activations_per_cycle", &stat_fallback_activations_per_cycle_);
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_never_commanded_interfaces", &stat_never_commanded_interfaces_);
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_heartbeat", &stat_heartbeat_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_setpoint_sequence", &stat_setpoint_sequence_);
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_read_sample_age_ms", &stat_read_sample_age_ms_);
     }
 
@@ -1339,6 +1382,9 @@ namespace beckhoff_ads_hardware_interface
             return hardware_interface::return_type::OK;
         }
 
+        const uint32_t setpoint_sequence = setpoint_sequence_counter_.next();
+        const double setpoint_stamp_seconds = utilities::monotonicSeconds(std::chrono::steady_clock::now());
+
         uint64_t fallbacks_this_cycle = 0;
         uint64_t never_commanded_this_cycle = 0;
         const char *first_fallback_interface = nullptr;
@@ -1356,6 +1402,18 @@ namespace beckhoff_ads_hardware_interface
                 // and the counter routinely jumps.
                 const uint32_t beat = ++heartbeat_counter_;
                 memcpy(ptr_write_buffer_destination_current, &beat, sizeof(beat));
+                continue;
+            }
+
+            if (write_instruction.source == WriteValueSource::SETPOINT_SEQUENCE)
+            {
+                memcpy(ptr_write_buffer_destination_current, &setpoint_sequence, sizeof(setpoint_sequence));
+                continue;
+            }
+
+            if (write_instruction.source == WriteValueSource::SETPOINT_TIMESTAMP)
+            {
+                memcpy(ptr_write_buffer_destination_current, &setpoint_stamp_seconds, sizeof(setpoint_stamp_seconds));
                 continue;
             }
 

@@ -267,6 +267,11 @@ namespace beckhoff_ads_hardware_interface
     // only tags the write instruction whose value the interface generates itself.
     static constexpr const char *HEARTBEAT_INTERFACE_NAME = "__ads_link_heartbeat";
 
+    // Synthetic interface names for the setpoint annotation, written in the same sum-write
+    // transaction as the setpoints they describe. Never exported to ros2_control.
+    static constexpr const char *SETPOINT_SEQUENCE_INTERFACE_NAME = "__ads_setpoint_sequence";
+    static constexpr const char *SETPOINT_TIMESTAMP_INTERFACE_NAME = "__ads_setpoint_timestamp";
+
     /**
      * @brief Classifies which source provides a write instruction's value
      *
@@ -275,8 +280,25 @@ namespace beckhoff_ads_hardware_interface
      */
     static WriteValueSource classifyWriteValueSource(const std::string &interface_name);
 
+    /**
+     * @brief Appends a synthetic single-element write layout for an interface-owned symbol
+     *
+     * @param plc_symbol The PLC symbol the layout targets
+     * @param plc_type The PLC type of the symbol
+     * @param interface_name The synthetic interface name tagging the instruction
+     */
+    void append_synthetic_write_layout(
+        const std::string &plc_symbol, PLCType plc_type, const char *interface_name);
+
     std::string heartbeat_symbol_;        // PLC symbol to beat on; empty disables the heartbeat
     uint32_t heartbeat_counter_{0};       // advanced in write(), so control-loop thread only
+
+    std::string setpoint_sequence_symbol_;  // PLC symbol for the sequence; empty disables it
+    std::string setpoint_timestamp_symbol_; // PLC symbol for the timestamp; empty disables it
+    // Advanced once per write() cycle, so control-loop thread only. Counting cycles rather
+    // than transmitted buffers is deliberate: a coalesced buffer shows the PLC a jump,
+    // which tells it how many updates it lost.
+    utilities::SetpointSequenceCounter setpoint_sequence_counter_;
 
     // Connection target details kept for error logs (populated in configure_ads_device).
     std::string plc_ip_address_;
@@ -445,6 +467,7 @@ namespace beckhoff_ads_hardware_interface
     double stat_fallback_activations_per_cycle_{0.0};
     double stat_never_commanded_interfaces_{0.0};
     double stat_heartbeat_{0.0};
+    double stat_setpoint_sequence_{0.0};
     double stat_read_sample_age_ms_{0.0}; // age of the sample read() last published; control loop only
 
     std::vector<ReadInstruction> ads_read_instructions_;
