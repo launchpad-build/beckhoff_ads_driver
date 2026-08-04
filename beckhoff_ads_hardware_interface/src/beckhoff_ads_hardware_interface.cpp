@@ -240,6 +240,49 @@ namespace beckhoff_ads_hardware_interface
                         ex.what(), static_cast<long>(comms_outage_grace_.count()));
         }
 
+        // Whether a hard fault clears itself when the link recovers, or latches until the
+        // component is restarted. Latching is the default: a recovered link resuming the
+        // stream mid-outage would carry the current setpoint as a position step.
+        outage_latches_ = true;
+        {
+            const auto behaviour_it = info_.hardware_parameters.find("outage_behaviour");
+            if (behaviour_it != info_.hardware_parameters.end())
+            {
+                if (behaviour_it->second == "resume")
+                {
+                    outage_latches_ = false;
+                }
+                else if (behaviour_it->second != "latch")
+                {
+                    RCLCPP_WARN(getLogger(), "Unknown outage_behaviour '%s'. Expected latch or resume. Latching.",
+                                behaviour_it->second.c_str());
+                }
+            }
+        }
+
+        // How old the published read sample may grow before read() surfaces an error.
+        read_staleness_timeout_ns_ = 100000000;
+        try
+        {
+            const auto staleness_it = info_.hardware_parameters.find("read_staleness_timeout_ms");
+            if (staleness_it != info_.hardware_parameters.end())
+            {
+                const double ms = std::stod(staleness_it->second);
+                if (std::isfinite(ms) && ms >= 0.0)
+                {
+                    read_staleness_timeout_ns_ = static_cast<long long>(ms * 1e6);
+                }
+            }
+        }
+        catch (const std::exception &ex)
+        {
+            RCLCPP_WARN(getLogger(), "Invalid read_staleness_timeout_ms: %s. Using default 100 ms.", ex.what());
+        }
+        if (read_staleness_timeout_ns_ > 0 && read_poll_period_ns_ > 0)
+        {
+            read_staleness_timeout_ns_ = std::max(read_staleness_timeout_ns_, 3 * read_poll_period_ns_);
+        }
+
         // Scheduling for the I/O threads. The defaults give both threads SCHED_FIFO at
         // priority 50; a deployment can lower, raise or disable that through the parameters.
         {
@@ -864,15 +907,33 @@ namespace beckhoff_ads_hardware_interface
             std::ignore = set_state(ads_read_instructions_[i].state_handle, sample.values[i], false);
         }
 
-        stat_read_sample_age_ms_ =
-            (sample.sequence > 0)
-                ? std::chrono::duration_cast<std::chrono::nanoseconds>(
-                      std::chrono::steady_clock::now() - sample.stamp)
-                          .count() *
-                      1e-6
-                : std::numeric_limits<double>::quiet_NaN();
+        long long sample_age_ns = 0;
+        if (sample.sequence > 0)
+        {
+            sample_age_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - sample.stamp)
+                                .count();
+            stat_read_sample_age_ms_ = static_cast<double>(sample_age_ns) * 1e-6;
+        }
+        else
+        {
+            stat_read_sample_age_ms_ = std::numeric_limits<double>::quiet_NaN();
+        }
 
-        return read_hard_fault_.load(std::memory_order_acquire)
+        // Frozen feedback must not look healthy: a controller closing a loop on a stale
+        // sample is worse than a surfaced fault.
+        const bool sample_stale = read_staleness_timeout_ns_ > 0 && sample.sequence > 0 &&
+                                  sample_age_ns > read_staleness_timeout_ns_;
+        if (sample_stale)
+        {
+            RCLCPP_ERROR_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
+                                  "The published PLC state sample is %.1f ms old, over the %.1f ms staleness "
+                                  "timeout. Surfacing an error rather than frozen feedback.",
+                                  static_cast<double>(sample_age_ns) * 1e-6,
+                                  static_cast<double>(read_staleness_timeout_ns_) * 1e-6);
+        }
+
+        return (sample_stale || read_hard_fault_.load(std::memory_order_acquire))
                    ? hardware_interface::return_type::ERROR
                    : hardware_interface::return_type::OK;
     }
@@ -1093,7 +1154,10 @@ namespace beckhoff_ads_hardware_interface
                 sample.sequence = ++read_sample_sequence_;
                 read_sample_buffer_.publish();
 
-                read_hard_fault_.store(false, std::memory_order_release);
+                if (!(outage_latches_ && read_hard_fault_.load(std::memory_order_acquire)))
+                {
+                    read_hard_fault_.store(false, std::memory_order_release);
+                }
                 // Declare recovery only after the link has been good for a stable period, so a
                 // flapping link logs one outage instead of an error/recovery pair per cycle.
                 if (read_consecutive_failures_ > 0)
@@ -1364,7 +1428,10 @@ namespace beckhoff_ads_hardware_interface
             }
             else
             {
-                write_hard_fault_.store(false, std::memory_order_release);
+                if (!(outage_latches_ && write_hard_fault_.load(std::memory_order_acquire)))
+                {
+                    write_hard_fault_.store(false, std::memory_order_release);
+                }
                 // Declare recovery only after the link has been good for a stable period, so a
                 // flapping link logs one outage instead of an error/recovery pair per round-trip.
                 if (write_consecutive_failures_ > 0)

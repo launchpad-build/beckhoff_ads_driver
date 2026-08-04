@@ -260,8 +260,22 @@ namespace beckhoff_ads_hardware_interface
 
     // A comms outage shorter than this is ridden out on the last cached values; only once it
     // outlives the window does read()/write() surface an error and let the controller manager
-    // tear the stack down. Overridable via the comms_outage_grace_ms hardware parameter.
-    std::chrono::milliseconds comms_outage_grace_{1000};
+    // tear the stack down. Overridable via the comms_outage_grace_ms hardware parameter. The
+    // default suits a motion stream: it matches the PLC's own ROS link watchdog, so ROS
+    // notices a dead link no later than the machine stops. Telemetry stacks can raise it.
+    std::chrono::milliseconds comms_outage_grace_{100};
+
+    // With latching (the default) a hard fault survives link recovery, so the component
+    // faults and is restarted deliberately instead of resuming the stream with a silent
+    // position step of up to velocity times outage. outage_behaviour=resume restores the
+    // self-clearing behaviour, which suits hold-last telemetry and GPIO stacks.
+    bool outage_latches_{true};
+
+    // read() returns an error once the published sample is older than this, so a controller
+    // cannot close a loop on frozen feedback while everything reports healthy. Overridable
+    // via read_staleness_timeout_ms; 0 disables. Raised to three read poll periods when
+    // paced reading is slower than the configured value.
+    long long read_staleness_timeout_ns_{100000000};
 
     // ========= PLC ==============================
 
