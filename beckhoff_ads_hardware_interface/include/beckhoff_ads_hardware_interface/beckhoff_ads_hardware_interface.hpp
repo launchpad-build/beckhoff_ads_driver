@@ -179,6 +179,25 @@ namespace beckhoff_ads_hardware_interface
     CommandFallback parseCommandFallback(const std::string &policy_str, const std::string &interface_name);
 
     /**
+     * @brief Tells whether a state interface declared an initial_value in its description
+     *
+     * @param interface_name The full state interface name
+     * @returns True when the URDF declared a non-empty initial_value for it
+     */
+    bool stateInterfaceHasDeclaredInitialValue(const std::string &interface_name) const;
+
+    /**
+     * @brief Pins the state interfaces of dropped optional symbols to a defined value
+     *
+     * Interfaces without a declared initial_value are set to 0.0, so a consumer testing
+     * against zero never reads an absent symbol as asserted. A declared initial_value is
+     * left in place; the framework applied it to the handle at export.
+     *
+     * @param dropped_interfaces State interface names whose PLC symbol was dropped
+     */
+    void settle_dropped_state_interfaces(const std::vector<std::string> &dropped_interfaces);
+
+    /**
      * @brief Records a failed SUM-read round-trip for outage and recovery logs
      *
      * Stamps the outage start on the first failure and resets recovery tracking.

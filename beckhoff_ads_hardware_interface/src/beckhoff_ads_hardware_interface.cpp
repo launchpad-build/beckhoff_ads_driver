@@ -9,6 +9,7 @@
 // Author: Nikola Banovic
 // Contributor: Hajar Bartakh
 
+#include <array>
 #include <limits>
 #include <vector>
 #include <cstdint>
@@ -199,7 +200,8 @@ namespace beckhoff_ads_hardware_interface
         RCLCPP_INFO(getLogger(), "Fetching ADS handles for configured PLC variables...");
         bool required_symbol_missing = false;
 
-        auto resolve_handles = [&](std::vector<ADSDataLayout> &layouts, const char *direction)
+        auto resolve_handles = [&](std::vector<ADSDataLayout> &layouts, const char *direction,
+                                   std::vector<std::string> &dropped_interfaces)
         {
             for (auto &layout : layouts)
             {
@@ -215,8 +217,12 @@ namespace beckhoff_ads_hardware_interface
                     if (layout.optional)
                     {
                         RCLCPP_WARN(getLogger(),
-                                    "\tOptional %s symbol '%s' is not on the PLC (%s). Skipping it; its interfaces keep their initial value.",
+                                    "\tOptional %s symbol '%s' is not on the PLC (%s). Skipping it; its interfaces are set to their declared initial_value, or 0.0 without one.",
                                     direction, layout.plc_name_symbolic.c_str(), ex.what());
+                        for (const auto &[index, interface_name] : layout.ros2_interfaces_)
+                        {
+                            dropped_interfaces.push_back(interface_name);
+                        }
                     }
                     else
                     {
@@ -242,8 +248,11 @@ namespace beckhoff_ads_hardware_interface
             layouts = std::move(resolved);
         };
 
-        resolve_handles(ads_item_layouts_read_, "read");
-        resolve_handles(ads_item_layouts_write_, "write");
+        std::vector<std::string> dropped_state_interfaces;
+        std::vector<std::string> dropped_command_interfaces;
+        resolve_handles(ads_item_layouts_read_, "read", dropped_state_interfaces);
+        resolve_handles(ads_item_layouts_write_, "write", dropped_command_interfaces);
+        settle_dropped_state_interfaces(dropped_state_interfaces);
 
         if (required_symbol_missing)
         {
@@ -290,6 +299,33 @@ namespace beckhoff_ads_hardware_interface
         }
 
         return CallbackReturn::SUCCESS;
+    }
+
+    bool BeckhoffADSHardwareInterface::stateInterfaceHasDeclaredInitialValue(const std::string &interface_name) const
+    {
+        bool result = false;
+        const std::array<const std::unordered_map<std::string, hardware_interface::InterfaceDescription> *, 3> maps = {
+            &joint_state_interfaces_, &gpio_state_interfaces_, &sensor_state_interfaces_};
+        for (const auto *map : maps)
+        {
+            const auto it = map->find(interface_name);
+            if (it != map->end() && !it->second.interface_info.initial_value.empty())
+            {
+                result = true;
+            }
+        }
+        return result;
+    }
+
+    void BeckhoffADSHardwareInterface::settle_dropped_state_interfaces(const std::vector<std::string> &dropped_interfaces)
+    {
+        for (const std::string &interface_name : dropped_interfaces)
+        {
+            if (!stateInterfaceHasDeclaredInitialValue(interface_name))
+            {
+                set_state(interface_name, 0.0);
+            }
+        }
     }
 
     bool BeckhoffADSHardwareInterface::build_sum_read_buffers()
