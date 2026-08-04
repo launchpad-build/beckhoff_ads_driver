@@ -1079,6 +1079,10 @@ namespace beckhoff_ads_hardware_interface
     {
         stat_read_rtt_ms_ = static_cast<double>(read_rtt_ns_.load(std::memory_order_relaxed)) * 1e-6;
         stat_write_rtt_ms_ = static_cast<double>(write_rtt_ns_.load(std::memory_order_relaxed)) * 1e-6;
+        stat_write_buffer_age_ms_ =
+            static_cast<double>(write_buffer_age_ns_.load(std::memory_order_relaxed)) * 1e-6;
+        stat_write_handoff_latency_ms_ =
+            static_cast<double>(write_handoff_latency_ns_.load(std::memory_order_relaxed)) * 1e-6;
         stat_read_transactions_ = static_cast<double>(read_transactions_total_.load(std::memory_order_relaxed));
         stat_write_transactions_ = static_cast<double>(write_transactions_total_.load(std::memory_order_relaxed));
         stat_write_coalesced_ = static_cast<double>(write_coalesced_total_.load(std::memory_order_relaxed));
@@ -1096,6 +1100,8 @@ namespace beckhoff_ads_hardware_interface
     {
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_read_rtt_ms", &stat_read_rtt_ms_);
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_write_rtt_ms", &stat_write_rtt_ms_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_write_buffer_age_ms", &stat_write_buffer_age_ms_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_write_handoff_latency_ms", &stat_write_handoff_latency_ms_);
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_read_transactions", &stat_read_transactions_);
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_write_transactions", &stat_write_transactions_);
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_write_coalesced", &stat_write_coalesced_);
@@ -1428,6 +1434,7 @@ namespace beckhoff_ads_hardware_interface
                     write_pending_request_.layout_indices = compact_layout_indices_;
                 }
                 write_pending_request_.num_items = write_pending_request_.layout_indices.size();
+                write_pending_request_.handoff_stamp = std::chrono::steady_clock::now();
                 write_pending_ = true;
             }
             write_cv_.notify_one();
@@ -1456,9 +1463,15 @@ namespace beckhoff_ads_hardware_interface
                 send_request.buffer.swap(write_pending_request_.buffer);
                 send_request.layout_indices.swap(write_pending_request_.layout_indices);
                 send_request.num_items = write_pending_request_.num_items;
+                send_request.handoff_stamp = write_pending_request_.handoff_stamp;
                 write_pending_ = false;
             }
             ads_buffer_sum_write_response_.resize(send_request.num_items * sizeof(uint32_t));
+            write_buffer_age_ns_.store(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - send_request.handoff_stamp)
+                    .count(),
+                std::memory_order_relaxed);
 
             uint32_t bytes_response_buffer_from_plc = 0;
             long ads_sum_write_error;
@@ -1471,9 +1484,13 @@ namespace beckhoff_ads_hardware_interface
                 send_request.buffer.size(),
                 send_request.buffer.data(),
                 &bytes_response_buffer_from_plc);
+            const std::chrono::steady_clock::time_point write_complete = std::chrono::steady_clock::now();
             write_rtt_ns_.store(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - write_rtt_start)
+                std::chrono::duration_cast<std::chrono::nanoseconds>(write_complete - write_rtt_start)
+                    .count(),
+                std::memory_order_relaxed);
+            write_handoff_latency_ns_.store(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(write_complete - send_request.handoff_stamp)
                     .count(),
                 std::memory_order_relaxed);
             write_transactions_total_.fetch_add(1, std::memory_order_relaxed);

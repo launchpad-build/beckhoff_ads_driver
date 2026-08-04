@@ -161,6 +161,9 @@ namespace beckhoff_ads_hardware_interface
     std::vector<uint8_t> buffer;
     std::vector<size_t> layout_indices; // original layout index of each item in the buffer
     size_t num_items = 0;
+    // When write() handed this buffer over. The round-trip time alone hides the queueing
+    // delay a setpoint suffers before the send even starts; this stamp exposes it.
+    std::chrono::steady_clock::time_point handoff_stamp{};
   };
 
   class BeckhoffADSHardwareInterface : public hardware_interface::SystemInterface
@@ -371,6 +374,8 @@ namespace beckhoff_ads_hardware_interface
     // alongside the trajectory it was carrying.
     std::atomic<long long> read_rtt_ns_{0};
     std::atomic<long long> write_rtt_ns_{0};
+    std::atomic<long long> write_buffer_age_ns_{0};      // handoff to send start, sampled at dequeue
+    std::atomic<long long> write_handoff_latency_ns_{0}; // handoff to send complete
     std::atomic<uint64_t> read_transactions_total_{0};
     std::atomic<uint64_t> write_transactions_total_{0};
     std::atomic<uint64_t> write_coalesced_total_{0};
@@ -398,6 +403,8 @@ namespace beckhoff_ads_hardware_interface
     // Introspected mirrors. Only the control loop writes these.
     double stat_read_rtt_ms_{0.0};
     double stat_write_rtt_ms_{0.0};
+    double stat_write_buffer_age_ms_{0.0};
+    double stat_write_handoff_latency_ms_{0.0};
     double stat_read_transactions_{0.0};
     double stat_write_transactions_{0.0};
     double stat_write_coalesced_{0.0};
