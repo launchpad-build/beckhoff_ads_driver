@@ -48,6 +48,49 @@ TEST(ToUpperCopy, UpperCasesPlainAscii)
   EXPECT_EQ(utilities::toUpperCopy("Bool"), "BOOL");
 }
 
+namespace
+{
+  std::vector<uint8_t> makeFullRequest()
+  {
+    // Three items: headers of 3 bytes each, then data blocks of 2, 3 and 1 bytes.
+    return {0xA1, 0xA2, 0xA3, 0xB1, 0xB2, 0xB3, 0xC1, 0xC2, 0xC3,
+            0x10, 0x11, 0x20, 0x21, 0x22, 0x30};
+  }
+
+  std::vector<beckhoff_ads_hardware_interface::utilities::SumWriteItemSpan> makeSpans()
+  {
+    return {{0, 3, 9, 2}, {3, 3, 11, 3}, {6, 3, 14, 1}};
+  }
+} // namespace
+
+TEST(CompactSumWriteRequest, AllItemsIncludedReproducesTheFullRequest)
+{
+  std::vector<uint8_t> compact;
+  std::vector<size_t> indices;
+  utilities::compactSumWriteRequest(makeFullRequest(), makeSpans(), {1, 1, 1}, compact, indices);
+  EXPECT_EQ(compact, makeFullRequest());
+  EXPECT_EQ(indices, (std::vector<size_t>{0, 1, 2}));
+}
+
+TEST(CompactSumWriteRequest, ExcludedItemsAreAbsentFromHeadersAndData)
+{
+  std::vector<uint8_t> compact;
+  std::vector<size_t> indices;
+  utilities::compactSumWriteRequest(makeFullRequest(), makeSpans(), {1, 0, 1}, compact, indices);
+  const std::vector<uint8_t> expected = {0xA1, 0xA2, 0xA3, 0xC1, 0xC2, 0xC3, 0x10, 0x11, 0x30};
+  EXPECT_EQ(compact, expected);
+  EXPECT_EQ(indices, (std::vector<size_t>{0, 2}));
+}
+
+TEST(CompactSumWriteRequest, NoItemsIncludedYieldsAnEmptyRequest)
+{
+  std::vector<uint8_t> compact = {0xFF};
+  std::vector<size_t> indices = {9};
+  utilities::compactSumWriteRequest(makeFullRequest(), makeSpans(), {0, 0, 0}, compact, indices);
+  EXPECT_TRUE(compact.empty());
+  EXPECT_TRUE(indices.empty());
+}
+
 TEST(ToUpperCopy, ToleratesBytesOutsideTheAsciiRange)
 {
   const std::string with_high_bytes = "lre\xC3\xA9l";

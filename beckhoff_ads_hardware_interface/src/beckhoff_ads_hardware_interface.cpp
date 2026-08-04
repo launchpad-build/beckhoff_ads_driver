@@ -10,6 +10,7 @@
 // Contributor: Hajar Bartakh
 
 #include <array>
+#include <cmath>
 #include <limits>
 #include <vector>
 #include <cstdint>
@@ -91,6 +92,74 @@ namespace beckhoff_ads_hardware_interface
             default:
                 return std::numeric_limits<double>::quiet_NaN();
             }
+        }
+
+        // Encodes a double into one PLC element at dst. The exact inverse of
+        // decode_plc_element. Returns false for unsupported types.
+        bool encode_plc_element(PLCType plc_type, double val, uint8_t *dst)
+        {
+            bool result = true;
+            switch (plc_type)
+            {
+            case PLCType::LREAL:
+            {
+                std::memcpy(dst, &val, sizeof(val));
+                break;
+            }
+            case PLCType::REAL:
+            {
+                const float v = static_cast<float>(val);
+                std::memcpy(dst, &v, sizeof(v));
+                break;
+            }
+            case PLCType::BOOL:
+            {
+                const uint8_t v = (val != 0.0) ? 1 : 0;
+                std::memcpy(dst, &v, sizeof(v));
+                break;
+            }
+            case PLCType::SINT:
+            {
+                const int8_t v = static_cast<int8_t>(std::round(val));
+                std::memcpy(dst, &v, sizeof(v));
+                break;
+            }
+            case PLCType::USINT:
+            case PLCType::BYTE:
+            {
+                const uint8_t v = static_cast<uint8_t>(std::round(val));
+                std::memcpy(dst, &v, sizeof(v));
+                break;
+            }
+            case PLCType::INT:
+            {
+                const int16_t v = static_cast<int16_t>(std::round(val));
+                std::memcpy(dst, &v, sizeof(v));
+                break;
+            }
+            case PLCType::UINT:
+            {
+                const uint16_t v = static_cast<uint16_t>(std::round(val));
+                std::memcpy(dst, &v, sizeof(v));
+                break;
+            }
+            case PLCType::DINT:
+            {
+                const int32_t v = static_cast<int32_t>(std::round(val));
+                std::memcpy(dst, &v, sizeof(v));
+                break;
+            }
+            case PLCType::UDINT:
+            {
+                const uint32_t v = static_cast<uint32_t>(std::round(val));
+                std::memcpy(dst, &v, sizeof(v));
+                break;
+            }
+            default:
+                result = false;
+                break;
+            }
+            return result;
         }
     } // namespace
 
@@ -386,6 +455,11 @@ namespace beckhoff_ads_hardware_interface
         ads_write_instructions_.clear();
         ads_buffer_sum_write_request_.clear();
         ads_buffer_sum_write_response_.clear();
+        write_item_spans_.clear();
+        identity_layout_indices_.clear();
+        write_layout_seeded_.clear();
+        ads_buffer_sum_write_compact_.clear();
+        compact_layout_indices_.clear();
 
         num_items_write_ = ads_item_layouts_write_.size();
         if (num_items_write_ == 0)
@@ -416,6 +490,14 @@ namespace beckhoff_ads_hardware_interface
 
                 layout.offset_in_write_request_data = total_header_size + current_data_offset;
 
+                utilities::SumWriteItemSpan span;
+                span.header_offset = i * sizeof(ADS_ITEM_REQ_HEADER);
+                span.header_length = sizeof(ADS_ITEM_REQ_HEADER);
+                span.data_offset = layout.offset_in_write_request_data;
+                span.data_length = header_block_ptr[i].NumBytesData;
+                write_item_spans_.push_back(span);
+                identity_layout_indices_.push_back(i);
+
                 // For interfaces targeting the same PLC symbol
                 for (const auto &[index, interface_name] : layout.ros2_interfaces_)
                 {
@@ -426,6 +508,7 @@ namespace beckhoff_ads_hardware_interface
                     write_instruction.command_interface_name = interface_name;
                     write_instruction.fallback_state_interface_name = "";
                     write_instruction.is_heartbeat = (interface_name == HEARTBEAT_INTERFACE_NAME);
+                    write_instruction.layout_index = i;
 
                     const auto policy_it = layout.fallback_policies_.find(interface_name);
                     write_instruction.fallback = (policy_it != layout.fallback_policies_.end())
@@ -449,6 +532,22 @@ namespace beckhoff_ads_hardware_interface
                         }
                     }
 
+                    if (write_instruction.is_heartbeat)
+                    {
+                        write_instruction.seeded = true;
+                    }
+                    else
+                    {
+                        const double initial = get_command(interface_name);
+                        if (std::isfinite(initial))
+                        {
+                            uint8_t *seed_destination = ads_buffer_sum_write_request_.data() +
+                                                        write_instruction.write_buffer_offset_data;
+                            write_instruction.seeded =
+                                encode_plc_element(write_instruction.plc_type, initial, seed_destination);
+                        }
+                    }
+
                     // The command interfaces' names are ordered by ascending indexes of the PLC array thanks to layout.ros2_interfaces_ being a map
                     ads_write_instructions_.push_back(write_instruction);
                 }
@@ -456,6 +555,8 @@ namespace beckhoff_ads_hardware_interface
                 current_data_offset += header_block_ptr[i].NumBytesData;
                 i++;
             }
+
+            write_layout_seeded_.assign(num_items_write_, 1);
 
             RCLCPP_INFO(getLogger(), "ADS Sum WRITE configured for %zu items. Request: %zu bytes, Response: %zu bytes.",
                         num_items_write_, ads_buffer_sum_write_request_.size(), ads_buffer_sum_write_response_.size());
@@ -566,25 +667,6 @@ namespace beckhoff_ads_hardware_interface
         {
             for (const auto &[name, descr] : type_command_interfaces_)
             {
-                [[maybe_unused]] double initial_value = std::numeric_limits<double>::quiet_NaN();
-
-                if (descr.interface_info.parameters.count("initial_value"))
-                {
-                    try
-                    {
-                        initial_value = std::stod(descr.interface_info.parameters.at("initial_value"));
-                    }
-                    catch (const std::exception &ex)
-                    { // Catch conversion errors
-                        RCLCPP_WARN(
-                            getLogger(),
-                            "Invalid 'initial_value' ('%s') for command interface '%s'. Using NaN. Error: %s",
-                            descr.interface_info.parameters.at("initial_value").c_str(),
-                            name.c_str(),
-                            ex.what());
-                    }
-                }
-
                 std::string plc_symbol;
                 std::string plc_type_str;
                 size_t num_elements = 1;
@@ -969,6 +1051,8 @@ namespace beckhoff_ads_hardware_interface
         uint64_t fallbacks_this_cycle = 0;
         uint64_t never_commanded_this_cycle = 0;
 
+        std::fill(write_layout_seeded_.begin(), write_layout_seeded_.end(), 1);
+
         for (auto &write_instruction : ads_write_instructions_)
         {
             uint8_t *ptr_write_buffer_destination_current = ads_buffer_sum_write_request_.data() + write_instruction.write_buffer_offset_data;
@@ -979,8 +1063,6 @@ namespace beckhoff_ads_hardware_interface
                 memcpy(ptr_write_buffer_destination_current, &beat, sizeof(beat));
                 continue;
             }
-
-            // TODO: performance - Hoist the switch/case above for loop?
 
             // store the current val and reset the ros-side command value
             double val = get_command(write_instruction.command_interface_name);
@@ -1017,89 +1099,27 @@ namespace beckhoff_ads_hardware_interface
                     val = get_state(write_instruction.fallback_state_interface_name);
                 }
 
-                // if we STILL don't have a fallback value on, don't update the write buffer.
-                // the last valid command is written
+                // Hold the last value: leave this field of the buffer alone, which keeps
+                // whatever was packed on the most recent cycle that did carry a command.
+                // A field nothing has ever provided a value for keeps its whole item out
+                // of the transmitted request instead.
                 if (std::isnan(val))
                 {
+                    if (!write_instruction.seeded)
+                    {
+                        write_layout_seeded_[write_instruction.layout_index] = 0;
+                    }
                     continue;
                 }
             }
 
-            switch (write_instruction.plc_type)
+            if (!encode_plc_element(write_instruction.plc_type, val, ptr_write_buffer_destination_current))
             {
-            case PLCType::LREAL:
-            {
-                // val is already double (LREAL is 8 bytes - 64 bit)
-                memcpy(ptr_write_buffer_destination_current, &val, plcTypeByteSize(write_instruction.plc_type));
-                break;
-            }
-            case PLCType::REAL:
-            {
-                float plc_val = static_cast<float>(val);
-                memcpy(ptr_write_buffer_destination_current, &plc_val, plcTypeByteSize(write_instruction.plc_type));
-                break;
-            }
-            case PLCType::BOOL:
-            {
-                // bool is size of byte in PLC
-                uint8_t plc_val = (val != 0.0) ? 1 : 0;
-                uint8_t previous_val;
-                memcpy(&previous_val, ptr_write_buffer_destination_current, sizeof(uint8_t));
-                if (previous_val != plc_val)
-                {
-                    RCLCPP_DEBUG(getLogger(), "Write command '%s': %u -> %u",
-                                 write_instruction.command_interface_name.c_str(), previous_val, plc_val);
-                }
-                memcpy(ptr_write_buffer_destination_current, &plc_val, plcTypeByteSize(write_instruction.plc_type));
-                break;
-            }
-            case PLCType::SINT:
-            {
-                int8_t plc_val = static_cast<int8_t>(std::round(val));
-                memcpy(ptr_write_buffer_destination_current, &plc_val, plcTypeByteSize(write_instruction.plc_type));
-                break;
-            }
-            case PLCType::USINT:
-            case PLCType::BYTE:
-            {
-                uint8_t plc_val = static_cast<uint8_t>(std::round(val));
-                memcpy(ptr_write_buffer_destination_current, &plc_val, plcTypeByteSize(write_instruction.plc_type));
-                break;
-            }
-            case PLCType::INT:
-            {
-                int16_t plc_val = static_cast<int16_t>(std::round(val));
-                memcpy(ptr_write_buffer_destination_current, &plc_val, plcTypeByteSize(write_instruction.plc_type));
-                break;
-            }
-            case PLCType::UINT:
-            {
-                uint16_t plc_val = static_cast<uint16_t>(std::round(val));
-                memcpy(ptr_write_buffer_destination_current, &plc_val, plcTypeByteSize(write_instruction.plc_type));
-                break;
-            }
-            case PLCType::DINT:
-            {
-                int32_t plc_val = static_cast<int32_t>(std::round(val));
-                memcpy(ptr_write_buffer_destination_current, &plc_val, plcTypeByteSize(write_instruction.plc_type));
-                break;
-            }
-            case PLCType::UDINT:
-            {
-                uint32_t plc_val = static_cast<uint32_t>(std::round(val));
-                memcpy(ptr_write_buffer_destination_current, &plc_val, plcTypeByteSize(write_instruction.plc_type));
-                break;
-            }
-            /* String not supported for now
-            case PLCType::STRING: break;
-            */
-            case PLCType::UNKNOWN:
-            default:
-                RCLCPP_FATAL(getLogger(), "UNKNOWN PLC type (%d) for the interface '%s' during write. Sending zeroed data of size %zu.",
-                             static_cast<int>(write_instruction.plc_type), write_instruction.command_interface_name.c_str(), plcTypeByteSize(write_instruction.plc_type));
+                RCLCPP_FATAL(getLogger(), "UNKNOWN PLC type (%d) for the interface '%s' during write.",
+                             static_cast<int>(write_instruction.plc_type), write_instruction.command_interface_name.c_str());
                 return hardware_interface::return_type::ERROR;
-                break;
             }
+            write_instruction.seeded = true;
         }
 
         fallback_activations_cycle_.store(fallbacks_this_cycle, std::memory_order_relaxed);
@@ -1109,17 +1129,43 @@ namespace beckhoff_ads_hardware_interface
 
         // Hand the freshly packed request to the writer thread and return immediately. A newer
         // buffer overwrites one not yet sent, so the writer never backlogs (only the latest
-        // setpoints matter).
+        // setpoints matter). Items whose fields nothing has provided yet are left out of the
+        // handed-over request, so the PLC never receives a value nothing commanded.
+        const bool all_layouts_seeded =
+            std::all_of(write_layout_seeded_.begin(), write_layout_seeded_.end(),
+                        [](uint8_t seeded)
+                        { return seeded != 0; });
+        if (!all_layouts_seeded)
         {
-            std::lock_guard<std::mutex> lock(write_mutex_);
-            if (write_pending_)
-            {
-                write_coalesced_total_.fetch_add(1, std::memory_order_relaxed);
-            }
-            write_pending_request_ = ads_buffer_sum_write_request_;
-            write_pending_ = true;
+            utilities::compactSumWriteRequest(ads_buffer_sum_write_request_, write_item_spans_,
+                                              write_layout_seeded_, ads_buffer_sum_write_compact_,
+                                              compact_layout_indices_);
         }
-        write_cv_.notify_one();
+
+        const bool anything_to_send = all_layouts_seeded || !compact_layout_indices_.empty();
+        if (anything_to_send)
+        {
+            {
+                std::lock_guard<std::mutex> lock(write_mutex_);
+                if (write_pending_)
+                {
+                    write_coalesced_total_.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (all_layouts_seeded)
+                {
+                    write_pending_request_.buffer = ads_buffer_sum_write_request_;
+                    write_pending_request_.layout_indices = identity_layout_indices_;
+                }
+                else
+                {
+                    write_pending_request_.buffer = ads_buffer_sum_write_compact_;
+                    write_pending_request_.layout_indices = compact_layout_indices_;
+                }
+                write_pending_request_.num_items = write_pending_request_.layout_indices.size();
+                write_pending_ = true;
+            }
+            write_cv_.notify_one();
+        }
 
         return write_hard_fault_.load(std::memory_order_acquire)
                    ? hardware_interface::return_type::ERROR
@@ -1128,7 +1174,7 @@ namespace beckhoff_ads_hardware_interface
 
     void BeckhoffADSHardwareInterface::writer_loop()
     {
-        std::vector<uint8_t> send_buffer;
+        PendingWrite send_request;
         while (true)
         {
             {
@@ -1141,9 +1187,12 @@ namespace beckhoff_ads_hardware_interface
                 }
                 // O(1) swap, no copy. write() keeps its own stable buffer, so skipped fields
                 // retain their last value.
-                send_buffer.swap(write_pending_request_);
+                send_request.buffer.swap(write_pending_request_.buffer);
+                send_request.layout_indices.swap(write_pending_request_.layout_indices);
+                send_request.num_items = write_pending_request_.num_items;
                 write_pending_ = false;
             }
+            ads_buffer_sum_write_response_.resize(send_request.num_items * sizeof(uint32_t));
 
             // Lock only around the round-trip; the writer owns the write response buffer, so its
             // error decoding below runs unlocked. The gap between the reader's round-trips lets
@@ -1155,11 +1204,11 @@ namespace beckhoff_ads_hardware_interface
                 std::lock_guard<std::mutex> io_lock(ads_io_mutex_);
                 ads_sum_write_error = ads_device_->ReadWriteReqEx2(
                     ADSIGRP_SUMUP_WRITE,
-                    num_items_write_,
+                    send_request.num_items,
                     ads_buffer_sum_write_response_.size(),
                     ads_buffer_sum_write_response_.data(),
-                    send_buffer.size(),
-                    send_buffer.data(),
+                    send_request.buffer.size(),
+                    send_request.buffer.data(),
                     &bytes_response_buffer_from_plc);
             }
             write_rtt_ns_.store(
@@ -1200,21 +1249,22 @@ namespace beckhoff_ads_hardware_interface
             // One error code per write item, in request order: index i maps to layout i.
             // Only every item failing counts as a link failure.
             size_t items_failed = 0;
-            for (size_t i = 0; i < num_items_write_; ++i)
+            for (size_t i = 0; i < send_request.num_items; ++i)
             {
                 uint32_t item_error_code;
                 memcpy(&item_error_code, ads_buffer_sum_write_response_.data() + i * sizeof(uint32_t), sizeof(uint32_t));
                 if (item_error_code != ADSERR_NOERR)
                 {
+                    const ADSDataLayout &failed_layout = ads_item_layouts_write_[send_request.layout_indices[i]];
                     RCLCPP_WARN_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
                                          "ADS Sum Write sub-op for '%s' (handle 0x%X) failed: 0x%X (%s)",
-                                         ads_item_layouts_write_[i].plc_name_symbolic.c_str(), ads_item_layouts_write_[i].ads_handle, item_error_code,
+                                         failed_layout.plc_name_symbolic.c_str(), failed_layout.ads_handle, item_error_code,
                                          adsErrorText(static_cast<long>(item_error_code)));
                     ++items_failed;
                 }
             }
 
-            if (items_failed == num_items_write_ && num_items_write_ > 0)
+            if (items_failed == send_request.num_items && send_request.num_items > 0)
             {
                 record_write_failure();
             }
