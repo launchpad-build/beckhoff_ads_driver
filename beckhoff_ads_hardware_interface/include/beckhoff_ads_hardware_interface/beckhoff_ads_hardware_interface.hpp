@@ -162,7 +162,7 @@ namespace beckhoff_ads_hardware_interface
     // An ERROR out of read()/write() transitions the component straight here, without
     // on_deactivate or on_shutdown running. Without this override the I/O threads kept
     // running on a component the controller manager had already given up on, and the next
-    // on_configure replaced ads_device_ underneath them.
+    // on_configure replaced the ADS devices underneath them.
     hardware_interface::CallbackReturn on_error(
         const rclcpp_lifecycle::State &previous_state) override;
 
@@ -255,11 +255,16 @@ namespace beckhoff_ads_hardware_interface
     size_t plcTypeByteSize(PLCType type_enum);
 
     // ADS Communication objects
-    // The reader and writer threads dereference this on every round-trip without holding a
-    // lock, so every site that resets or replaces it has to join both threads first
+    // The reader and writer threads dereference these on every round-trip without holding a
+    // lock, so every site that resets or replaces them has to join both threads first
     // (stop_io_threads). Otherwise a thread is left calling a method on a destroyed AdsDevice,
     // whose m_LocalPort is already freed.
-    std::unique_ptr<AdsDevice> ads_device_; // Manages the route/connection to the PLC
+    // Each device opens its own local AMS port (AdsPortOpenEx in the AdsDevice constructor)
+    // on the shared process-wide local net id, and the route to the PLC is refcounted, so
+    // the reader's and writer's round-trips never contend for a port. The AMS identity the
+    // PLC sees is one net id with two ports, which is one client, not two.
+    std::unique_ptr<AdsDevice> ads_read_device_;  // owned by the reader thread's round-trips
+    std::unique_ptr<AdsDevice> ads_write_device_; // owned by the writer thread's round-trips
     bool configure_ads_device();
 
     // Joins the I/O threads, releases the symbol handles and drops the device, in the only
@@ -267,7 +272,7 @@ namespace beckhoff_ads_hardware_interface
     void teardown_ads_device();
 
     // Releases every cached PLC symbol handle (ADSDataLayout::ads_handle_owner). Each handle's
-    // deleter calls DeleteSymbolHandle through ads_device_, so this MUST run while ads_device_
+    // deleter calls DeleteSymbolHandle through the issuing device, so this must run while it
     // is still alive, i.e. before resetting/replacing it. Otherwise the deleters dereference a
     // freed device and segfault (seen on Ctrl-C teardown).
     void release_ads_handles();
@@ -370,13 +375,6 @@ namespace beckhoff_ads_hardware_interface
 
     void start_io_threads(); // spawns the writer and reader threads
     void stop_io_threads();  // signals and joins both worker threads; safe to call when idle
-
-    // Serialises the reader's and writer's ADS round-trips. ads_device_ owns a single local AMS
-    // port, and the underlying library allows only one in-flight request per port. Without this
-    // the writer's port reservation collides with the reader's in-flight read and fails. Held
-    // only around each ReadWriteReqEx2 call, never the control loop, so read()/write() stay
-    // non-blocking.
-    std::mutex ads_io_mutex_;
 
     // Writer thread: owns the SUM-write round-trip. write() marshals the latest command
     // buffer, hands it over here, and returns. Only the newest buffer is sent (coalescing).

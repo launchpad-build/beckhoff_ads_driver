@@ -166,7 +166,7 @@ namespace beckhoff_ads_hardware_interface
     BeckhoffADSHardwareInterface::~BeckhoffADSHardwareInterface()
     {
         // Backstop if no lifecycle shutdown ran: a joinable std::thread would call std::terminate.
-        // ads_device_ outlives the threads (declared first), so an in-flight ADS call completes.
+        // The ADS devices outlive the threads (declared first), so an in-flight call completes.
         stop_io_threads();
     }
 
@@ -186,14 +186,14 @@ namespace beckhoff_ads_hardware_interface
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_configure(
         const rclcpp_lifecycle::State & /*previous_state*/)
     {
-        // Join the I/O threads before anything below touches ads_device_. Both loops call
+        // Join the I/O threads before anything below touches the ADS devices. Both loops call
         // through it on every round-trip, and configure_ads_device() destroys the old device
         // when it assigns the new one. A reconfigure after an error transition is the case
         // that reaches here with the threads still running.
         stop_io_threads();
 
         // Release any symbol handles from a previous configure cycle before configure_ads_device()
-        // replaces ads_device_ below; the handle deleters call through ads_device_.
+        // replaces the devices below; the handle deleters call through the issuing device.
         release_ads_handles();
 
         // Optional pacing between SUM reads, to cap PLC load. Absent or invalid = unpaced.
@@ -270,13 +270,13 @@ namespace beckhoff_ads_hardware_interface
         bool required_symbol_missing = false;
 
         auto resolve_handles = [&](std::vector<ADSDataLayout> &layouts, const char *direction,
-                                   std::vector<std::string> &dropped_interfaces)
+                                   AdsDevice &device, std::vector<std::string> &dropped_interfaces)
         {
             for (auto &layout : layouts)
             {
                 try
                 {
-                    layout.ads_handle_owner.emplace(ads_device_->GetHandle(layout.plc_name_symbolic));
+                    layout.ads_handle_owner.emplace(device.GetHandle(layout.plc_name_symbolic));
                     layout.ads_handle = **layout.ads_handle_owner;
                     layout.handle_resolved = true;
                 }
@@ -319,8 +319,8 @@ namespace beckhoff_ads_hardware_interface
 
         std::vector<std::string> dropped_state_interfaces;
         std::vector<std::string> dropped_command_interfaces;
-        resolve_handles(ads_item_layouts_read_, "read", dropped_state_interfaces);
-        resolve_handles(ads_item_layouts_write_, "write", dropped_command_interfaces);
+        resolve_handles(ads_item_layouts_read_, "read", *ads_read_device_, dropped_state_interfaces);
+        resolve_handles(ads_item_layouts_write_, "write", *ads_write_device_, dropped_command_interfaces);
         settle_dropped_state_interfaces(dropped_state_interfaces);
 
         if (required_symbol_missing)
@@ -954,34 +954,17 @@ namespace beckhoff_ads_hardware_interface
         {
             const auto cycle_start = std::chrono::steady_clock::now();
 
-            // Only the reader touches the read response buffer, so decode happens outside the
-            // lock; the lock only guards the shared single-port round-trip against the writer.
-            // Let a waiting setpoint go first. Both threads share one AMS port, and a read
-            // started now holds it for a whole round trip, which at a 2 ms control period is
-            // most of the budget. Reads tolerate being a cycle late; setpoints do not.
-            {
-                std::unique_lock<std::mutex> write_lock(write_mutex_);
-                if (write_pending_)
-                {
-                    write_lock.unlock();
-                    std::this_thread::yield();
-                }
-            }
-
             uint32_t bytes_read_from_plc = 0;
             long ads_sum_read_error;
             const auto read_rtt_start = std::chrono::steady_clock::now();
-            {
-                std::lock_guard<std::mutex> io_lock(ads_io_mutex_);
-                ads_sum_read_error = ads_device_->ReadWriteReqEx2(
-                    ADSIGRP_SUMUP_READ,
-                    num_items_read_,
-                    ads_buffer_sum_read_response_.size(),
-                    ads_buffer_sum_read_response_.data(),
-                    ads_buffer_sum_read_request_.size(),
-                    ads_buffer_sum_read_request_.data(),
-                    &bytes_read_from_plc);
-            }
+            ads_sum_read_error = ads_read_device_->ReadWriteReqEx2(
+                ADSIGRP_SUMUP_READ,
+                num_items_read_,
+                ads_buffer_sum_read_response_.size(),
+                ads_buffer_sum_read_response_.data(),
+                ads_buffer_sum_read_request_.size(),
+                ads_buffer_sum_read_request_.data(),
+                &bytes_read_from_plc);
             read_rtt_ns_.store(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - read_rtt_start)
@@ -1251,23 +1234,17 @@ namespace beckhoff_ads_hardware_interface
             }
             ads_buffer_sum_write_response_.resize(send_request.num_items * sizeof(uint32_t));
 
-            // Lock only around the round-trip; the writer owns the write response buffer, so its
-            // error decoding below runs unlocked. The gap between the reader's round-trips lets
-            // the writer take the port, so it is not starved by the continuous reader.
             uint32_t bytes_response_buffer_from_plc = 0;
             long ads_sum_write_error;
             const auto write_rtt_start = std::chrono::steady_clock::now();
-            {
-                std::lock_guard<std::mutex> io_lock(ads_io_mutex_);
-                ads_sum_write_error = ads_device_->ReadWriteReqEx2(
-                    ADSIGRP_SUMUP_WRITE,
-                    send_request.num_items,
-                    ads_buffer_sum_write_response_.size(),
-                    ads_buffer_sum_write_response_.data(),
-                    send_request.buffer.size(),
-                    send_request.buffer.data(),
-                    &bytes_response_buffer_from_plc);
-            }
+            ads_sum_write_error = ads_write_device_->ReadWriteReqEx2(
+                ADSIGRP_SUMUP_WRITE,
+                send_request.num_items,
+                ads_buffer_sum_write_response_.size(),
+                ads_buffer_sum_write_response_.data(),
+                send_request.buffer.size(),
+                send_request.buffer.data(),
+                &bytes_response_buffer_from_plc);
             write_rtt_ns_.store(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - write_rtt_start)
@@ -1418,20 +1395,21 @@ namespace beckhoff_ads_hardware_interface
     void BeckhoffADSHardwareInterface::teardown_ads_device()
     {
         RCLCPP_INFO(getLogger(), "Releasing ADS resources...");
-        // Stop the worker threads before touching the device; both call through ads_device_.
+        // Stop the worker threads before touching the devices; both call through them.
         // Safe to call even if on_deactivate already joined them.
         stop_io_threads();
-        // Release symbol handles before the device: their deleters call DeleteSymbolHandle
-        // through ads_device_. Skipping this is what segfaulted on Ctrl-C.
+        // Release symbol handles before the devices: their deleters call DeleteSymbolHandle
+        // through the device that issued them. Skipping this is what segfaulted on Ctrl-C.
         release_ads_handles();
-        ads_device_.reset();
+        ads_read_device_.reset();
+        ads_write_device_.reset();
         RCLCPP_INFO(getLogger(), "ADS resources released.");
     }
 
     void BeckhoffADSHardwareInterface::release_ads_handles()
     {
         // reset() destroys the held AdsHandle, whose deleter releases the PLC symbol handle via
-        // ads_device_. Callers guarantee ads_device_ is still valid at this point.
+        // the device that issued it. Callers guarantee both devices are still valid here.
         for (auto &layout : ads_item_layouts_read_)
         {
             layout.ads_handle_owner.reset();
@@ -1482,14 +1460,16 @@ namespace beckhoff_ads_hardware_interface
             }
 
             bhf::ads::SetLocalAddress(local_net_id);
-            ads_device_ = std::make_unique<AdsDevice>(plc_ip, remote_net_id, plc_ams_port);
-            RCLCPP_INFO(getLogger(), "\tTimeout is: %u", ads_device_->GetTimeout());
+            ads_read_device_ = std::make_unique<AdsDevice>(plc_ip, remote_net_id, plc_ams_port);
+            ads_write_device_ = std::make_unique<AdsDevice>(plc_ip, remote_net_id, plc_ams_port);
+            RCLCPP_INFO(getLogger(), "\tTimeout is: %u", ads_read_device_->GetTimeout());
 
-            RCLCPP_INFO(getLogger(), "\tADS Device configured for PLC: %s, Port: %u", plc_ip.c_str(), plc_ams_port);
-            RCLCPP_INFO(getLogger(), "\tPLC AMS NetID: %s", plc_ams_net_id_str.c_str());
+            RCLCPP_INFO(getLogger(), "\tADS Devices configured for PLC: %s, Port: %u", plc_ip.c_str(), plc_ams_port);
+            RCLCPP_INFO(getLogger(), "\tPLC AMS NetID: %s. Reader on local AMS port %ld, writer on local AMS port %ld.",
+                        plc_ams_net_id_str.c_str(), ads_read_device_->GetLocalPort(), ads_write_device_->GetLocalPort());
 
             RCLCPP_INFO(getLogger(), "Requesting Device state...");
-            AdsDeviceState deviceState = ads_device_->GetState();
+            AdsDeviceState deviceState = ads_read_device_->GetState();
             RCLCPP_INFO(getLogger(), "\tCommunication successful! ADS State: %d, DeviceState: %d", deviceState.ads, deviceState.device);
         }
         catch (const std::out_of_range &ex)
