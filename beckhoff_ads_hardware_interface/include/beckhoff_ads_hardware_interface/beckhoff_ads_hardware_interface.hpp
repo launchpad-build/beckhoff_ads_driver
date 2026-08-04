@@ -33,6 +33,8 @@
 
 #include "ads/AdsLib.h"
 #include "ads/AdsDevice.h"
+
+#include "beckhoff_ads_hardware_interface/ads_interface_utilities.hpp"
 namespace beckhoff_ads_hardware_interface
 {
 
@@ -123,6 +125,19 @@ namespace beckhoff_ads_hardware_interface
     // Set on the first cycle this interface carried a command. Until then its fallback is
     // the normal case, not a dropout, and it must not count as one.
     bool has_been_commanded = false;
+    // Set once this field of the write buffer holds a value something provided: a command,
+    // a fallback, or the interface's initial_value at configure. An unseeded field must
+    // never reach the PLC; its whole item is left out of the transmitted request.
+    bool seeded = false;
+    size_t layout_index = 0; // index of the owning layout in ads_item_layouts_write_
+  };
+
+  // The latest packed sum-write request handed from write() to the writer thread.
+  struct PendingWrite
+  {
+    std::vector<uint8_t> buffer;
+    std::vector<size_t> layout_indices; // original layout index of each item in the buffer
+    size_t num_items = 0;
   };
 
   class BeckhoffADSHardwareInterface : public hardware_interface::SystemInterface
@@ -279,6 +294,15 @@ namespace beckhoff_ads_hardware_interface
     std::vector<uint8_t> ads_buffer_sum_write_response_;
     size_t num_items_write_ = 0;
 
+    // Per-layout spans and seeding state for leaving never-provided items out of the
+    // transmitted request. All owned by the control loop; the writer thread only sees
+    // the PendingWrite handed over under write_mutex_.
+    std::vector<utilities::SumWriteItemSpan> write_item_spans_;
+    std::vector<size_t> identity_layout_indices_;
+    std::vector<uint8_t> write_layout_seeded_;
+    std::vector<uint8_t> ads_buffer_sum_write_compact_;
+    std::vector<size_t> compact_layout_indices_;
+
     /**
      * @brief Copies the I/O threads' counters into the introspected mirrors
      *
@@ -360,7 +384,7 @@ namespace beckhoff_ads_hardware_interface
     std::thread write_thread_;
     std::mutex write_mutex_;
     std::condition_variable write_cv_;
-    std::vector<uint8_t> write_pending_request_; // latest packed SUM-write request awaiting send
+    PendingWrite write_pending_request_; // latest packed SUM-write request awaiting send
     bool write_pending_ = false;                 // a fresh buffer is waiting (guarded by write_mutex_)
     bool write_stop_ = false;                     // stop request (guarded by write_mutex_)
     std::atomic<bool> write_hard_fault_{false};   // outage outlived the grace window, surfaced by write()
