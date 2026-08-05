@@ -17,6 +17,7 @@ add_library(
   beckhoff_ads_hardware_interface
   SHARED
   src/beckhoff_ads_hardware_interface.cpp
+  src/ads_interface_utilities.cpp
 )
 
 target_include_directories(
@@ -64,5 +65,23 @@ ament_export_dependencies(
   rclcpp_lifecycle
   ads_vendor
 )
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_ads_interface_utilities
+    test/test_ads_interface_utilities.cpp
+  )
+  target_link_libraries(test_ads_interface_utilities beckhoff_ads_hardware_interface)
+
+  ament_add_gtest(test_interface_initial_value
+    test/test_interface_initial_value.cpp
+  )
+  target_link_libraries(test_interface_initial_value beckhoff_ads_hardware_interface)
+
+  ament_add_gtest(test_latest_sample_buffer
+    test/test_latest_sample_buffer.cpp
+  )
+  target_link_libraries(test_latest_sample_buffer beckhoff_ads_hardware_interface)
+endif()
 
 ament_package()
