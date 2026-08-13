@@ -300,7 +300,12 @@ void AlarmBridgeNode::produceDiagnostics(diagnostic_updater::DiagnosticStatusWra
   stat.add("source", alarm->source);
   stat.add("severity", alarm->severity);
   stat.add("count", alarm->count);
-  stat.add("last_alarm_utc", alarm->timestamp_utc);
+  // stat.add(key, double) streams through a default-precision ostringstream (6 significant
+  // digits), which mangles an epoch-seconds value down to ~10000s resolution. Format explicitly
+  // so the field stays usable for cross-checking against the PLC's own alarm timestamp.
+  char last_alarm_utc_str[32];
+  std::snprintf(last_alarm_utc_str, sizeof(last_alarm_utc_str), "%.6f", alarm->timestamp_utc);
+  stat.add("last_alarm_utc", std::string(last_alarm_utc_str));
   stat.add("age_s", age_s);
 
   if (age_s >= alarm_active_window_s_) {
