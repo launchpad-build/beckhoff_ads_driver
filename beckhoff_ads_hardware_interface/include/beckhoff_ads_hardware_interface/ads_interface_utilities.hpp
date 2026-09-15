@@ -59,11 +59,6 @@ namespace utilities
   /**
    * @brief Builds a sum-write request holding only the included items
    *
-   * The full request is laid out as all item headers followed by all item
-   * data blocks. The compacted request keeps that layout for the included
-   * items only, so items whose values were never provided are not
-   * transmitted at all.
-   *
    * @param full_request The complete packed sum-write request
    * @param spans Header and data spans of each item in the full request
    * @param include One entry per item; zero excludes the item

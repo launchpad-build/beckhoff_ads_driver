@@ -94,8 +94,7 @@ namespace beckhoff_ads_hardware_interface
             }
         }
 
-        // Encodes a double into one PLC element at dst. The exact inverse of
-        // decode_plc_element. Returns false for unsupported types.
+        // Encodes a double into one PLC element at dst; the inverse of decode_plc_element.
         bool encode_plc_element(PLCType plc_type, double val, uint8_t *dst)
         {
             bool result = true;
@@ -166,7 +165,6 @@ namespace beckhoff_ads_hardware_interface
     BeckhoffADSHardwareInterface::~BeckhoffADSHardwareInterface()
     {
         // Backstop if no lifecycle shutdown ran: a joinable std::thread would call std::terminate.
-        // The ADS devices outlive the threads (declared first), so an in-flight call completes.
         stop_io_threads();
     }
 
@@ -186,10 +184,6 @@ namespace beckhoff_ads_hardware_interface
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_configure(
         const rclcpp_lifecycle::State & /*previous_state*/)
     {
-        // Join the I/O threads before anything below touches the ADS devices. Both loops call
-        // through it on every round-trip, and configure_ads_device() destroys the old device
-        // when it assigns the new one. A reconfigure after an error transition is the case
-        // that reaches here with the threads still running.
         stop_io_threads();
 
         // Release any symbol handles from a previous configure cycle before configure_ads_device()
@@ -1088,10 +1082,8 @@ namespace beckhoff_ads_hardware_interface
                     val = get_state(write_instruction.fallback_state_interface_name);
                 }
 
-                // Hold the last value: leave this field of the buffer alone, which keeps
-                // whatever was packed on the most recent cycle that did carry a command.
-                // A field nothing has ever provided a value for keeps its whole item out
-                // of the transmitted request instead.
+                // if we STILL don't have a fallback value on, don't update the write buffer.
+                // the last valid command is written
                 if (std::isnan(val))
                 {
                     if (!write_instruction.seeded)
@@ -1118,8 +1110,7 @@ namespace beckhoff_ads_hardware_interface
 
         // Hand the freshly packed request to the writer thread and return immediately. A newer
         // buffer overwrites one not yet sent, so the writer never backlogs (only the latest
-        // setpoints matter). Items whose fields nothing has provided yet are left out of the
-        // handed-over request, so the PLC never receives a value nothing commanded.
+        // setpoints matter).
         const bool all_layouts_seeded =
             std::all_of(write_layout_seeded_.begin(), write_layout_seeded_.end(),
                         [](uint8_t seeded)

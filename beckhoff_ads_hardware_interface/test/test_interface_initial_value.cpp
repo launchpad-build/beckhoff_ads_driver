@@ -33,9 +33,7 @@ namespace
 </robot>)";
 } // namespace
 
-// The driver relies on the framework parsing <param name="initial_value"> into
-// the exported state handle: an unresolved optional symbol keeps that value,
-// and only interfaces without one need the explicit zero at configure.
+// The framework must parse <param name="initial_value"> into the exported state handle.
 TEST(InterfaceInitialValue, FrameworkAppliesDeclaredInitialValueToStateHandles)
 {
   const std::vector<hardware_interface::HardwareInfo> infos =

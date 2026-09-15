@@ -120,9 +120,7 @@ namespace beckhoff_ads_hardware_interface
     CommandFallback fallback = CommandFallback::HOLD_LAST;
     bool is_heartbeat = false; // value comes from the interface's own counter, not a controller
     bool has_been_commanded = false;
-    // Set once this field of the write buffer holds a value something provided: a command,
-    // a fallback, or the interface's initial_value at configure. An unseeded field must
-    // never reach the PLC; its whole item is left out of the transmitted request.
+    // An unseeded field keeps its whole item out of the transmitted request.
     bool seeded = false;
     size_t layout_index = 0; // index of the owning layout in ads_item_layouts_write_
   };
@@ -154,10 +152,7 @@ namespace beckhoff_ads_hardware_interface
     hardware_interface::CallbackReturn on_shutdown(
         const rclcpp_lifecycle::State &previous_state) override;
 
-    // An ERROR out of read()/write() transitions the component straight here, without
-    // on_deactivate or on_shutdown running. Without this override the I/O threads kept
-    // running on a component the controller manager had already given up on, and the next
-    // on_configure replaced the ADS devices underneath them.
+    // Entered straight from an ERROR in read()/write(), with no on_deactivate first.
     hardware_interface::CallbackReturn on_error(
         const rclcpp_lifecycle::State &previous_state) override;
 
@@ -198,10 +193,6 @@ namespace beckhoff_ads_hardware_interface
 
     /**
      * @brief Pins the state interfaces of dropped optional symbols to a defined value
-     *
-     * Interfaces without a declared initial_value are set to 0.0, so a consumer testing
-     * against zero never reads an absent symbol as asserted. A declared initial_value is
-     * left in place; the framework applied it to the handle at export.
      *
      * @param dropped_interfaces State interface names whose PLC symbol was dropped
      */
@@ -247,20 +238,13 @@ namespace beckhoff_ads_hardware_interface
     size_t plcTypeByteSize(PLCType type_enum);
 
     // ADS Communication objects
-    // The reader and writer threads dereference these on every round-trip without holding a
-    // lock, so every site that resets or replaces them has to join both threads first
-    // (stop_io_threads). Otherwise a thread is left calling a method on a destroyed AdsDevice,
-    // whose m_LocalPort is already freed.
-    // Each device opens its own local AMS port (AdsPortOpenEx in the AdsDevice constructor)
-    // on the shared process-wide local net id, and the route to the PLC is refcounted, so
-    // the reader's and writer's round-trips never contend for a port. The AMS identity the
-    // PLC sees is one net id with two ports, which is one client, not two.
+    // Reset or replace only after stop_io_threads() has joined both I/O threads.
+    // Two local AMS ports on one net id, so the reader and writer never contend for a port.
     std::unique_ptr<AdsDevice> ads_read_device_;  // owned by the reader thread's round-trips
     std::unique_ptr<AdsDevice> ads_write_device_; // owned by the writer thread's round-trips
     bool configure_ads_device();
 
-    // Joins the I/O threads, releases the symbol handles and drops the device, in the only
-    // order that is safe. Shared by on_shutdown and on_error.
+    // Joins the I/O threads, releases the handles and drops the devices, in that order.
     void teardown_ads_device();
 
     // Releases every cached PLC symbol handle (ADSDataLayout::ads_handle_owner). Each handle's
@@ -291,9 +275,7 @@ namespace beckhoff_ads_hardware_interface
     std::vector<uint8_t> ads_buffer_sum_write_response_;
     size_t num_items_write_ = 0;
 
-    // Per-layout spans and seeding state for leaving never-provided items out of the
-    // transmitted request. All owned by the control loop; the writer thread only sees
-    // the PendingWrite handed over under write_mutex_.
+    // Owned by the control loop; the writer thread only sees the handed-over PendingWrite.
     std::vector<utilities::SumWriteItemSpan> write_item_spans_;
     std::vector<size_t> identity_layout_indices_;
     std::vector<uint8_t> write_layout_seeded_;
