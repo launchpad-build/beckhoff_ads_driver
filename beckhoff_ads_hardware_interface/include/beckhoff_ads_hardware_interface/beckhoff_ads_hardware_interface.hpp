@@ -15,7 +15,6 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <deque>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -109,6 +108,8 @@ namespace beckhoff_ads_hardware_interface
     size_t read_buffer_offset_data;
     PLCType plc_type;
     std::string state_interface_name;
+    // Resolved once at configure so read() stays non-blocking on the control loop.
+    hardware_interface::StateInterface::SharedPtr state_handle;
   };
 
   struct WriteInstruction
@@ -123,6 +124,17 @@ namespace beckhoff_ads_hardware_interface
     // An unseeded field keeps its whole item out of the transmitted request.
     bool seeded = false;
     size_t layout_index = 0; // index of the owning layout in ads_item_layouts_write_
+    // Resolved once at configure so write() stays non-blocking. Null for the heartbeat.
+    hardware_interface::CommandInterface::SharedPtr command_handle;
+    hardware_interface::StateInterface::SharedPtr fallback_state_handle;
+  };
+
+  // One whole decoded SUM-read sample.
+  struct ReadSample
+  {
+    std::vector<double> values; // one per read instruction, in instruction order
+    std::chrono::steady_clock::time_point stamp{};
+    uint64_t sequence = 0; // 0 means no sample has been published yet
   };
 
   // The latest packed sum-write request handed from write() to the writer thread.
@@ -320,6 +332,7 @@ namespace beckhoff_ads_hardware_interface
     double stat_fallback_activations_per_cycle_{0.0};
     double stat_never_commanded_interfaces_{0.0};
     double stat_heartbeat_{0.0};
+    double stat_read_sample_age_ms_{0.0}; // age of the sample read() last published; control loop only
 
     std::vector<ReadInstruction> ads_read_instructions_;
     std::vector<WriteInstruction> ads_write_instructions_;
@@ -331,6 +344,17 @@ namespace beckhoff_ads_hardware_interface
 
     void start_io_threads(); // spawns the writer and reader threads
     void stop_io_threads();  // signals and joins both worker threads; safe to call when idle
+
+    /**
+     * @brief Applies the configured scheduling policy, priority and affinity to a thread
+     *
+     * @param thread The I/O thread to reschedule
+     * @param thread_name Human-readable thread name for the log messages
+     */
+    void apply_io_thread_scheduling(std::thread &thread, const char *thread_name);
+
+    // Overridable via the io_thread_scheduling_policy, io_thread_priority and io_thread_cpu_affinity parameters.
+    utilities::ThreadSchedulingConfig io_thread_scheduling_;
 
     // Writer thread: owns the SUM-write round-trip. write() marshals the latest command
     // buffer, hands it over here, and returns. Only the newest buffer is sent (coalescing).
@@ -353,7 +377,9 @@ namespace beckhoff_ads_hardware_interface
     std::thread read_thread_;
     std::atomic<bool> read_stop_{false};
     std::atomic<bool> read_hard_fault_{false};      // outage outlived the grace window, surfaced by read()
-    std::deque<std::atomic<double>> polling_read_cache_; // one slot per read instruction; deque keeps addresses stable
+    utilities::LatestSampleBuffer<ReadSample> read_sample_buffer_;
+    std::vector<double> last_decoded_values_; // reader thread only
+    uint64_t read_sample_sequence_ = 0;       // reader thread only
     long long read_poll_period_ns_ = 0;             // optional pacing between SUM reads; 0 = unpaced
     // Consecutive failed SUM-read round-trips, for outage and recovery logs. Reader thread only.
     size_t read_consecutive_failures_ = 0;

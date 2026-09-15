@@ -17,6 +17,10 @@
 #include <cstring> // std::memcpy
 #include <chrono>
 #include <thread>
+#include <tuple>
+
+#include <pthread.h>
+#include <sched.h>
 #include <algorithm> // std::transform
 
 #include "beckhoff_ads_hardware_interface/ads_interface_utilities.hpp"
@@ -227,6 +231,24 @@ namespace beckhoff_ads_hardware_interface
                         ex.what(), static_cast<long>(comms_outage_grace_.count()));
         }
 
+        {
+            auto param_or_empty = [this](const char *key) -> std::string
+            {
+                const auto it = info_.hardware_parameters.find(key);
+                return (it != info_.hardware_parameters.end()) ? it->second : std::string{};
+            };
+            const utilities::ThreadSchedulingParseResult scheduling_parse =
+                utilities::parseThreadScheduling(param_or_empty("io_thread_scheduling_policy"),
+                                                 param_or_empty("io_thread_priority"),
+                                                 param_or_empty("io_thread_cpu_affinity"));
+            if (!scheduling_parse.valid)
+            {
+                RCLCPP_WARN(getLogger(), "Invalid I/O thread scheduling parameters: %s. Using the defaults.",
+                            scheduling_parse.error.c_str());
+            }
+            io_thread_scheduling_ = scheduling_parse.config;
+        }
+
         heartbeat_symbol_.clear();
         auto heartbeat_it = info_.hardware_parameters.find("heartbeat_plc_symbol");
         if (heartbeat_it != info_.hardware_parameters.end() && !heartbeat_it->second.empty())
@@ -377,7 +399,8 @@ namespace beckhoff_ads_hardware_interface
     bool BeckhoffADSHardwareInterface::build_sum_read_buffers()
     {
         ads_read_instructions_.clear();
-        polling_read_cache_.clear();
+        last_decoded_values_.clear();
+        read_sample_sequence_ = 0;
         ads_buffer_sum_read_request_.clear();
         ads_buffer_sum_read_response_.clear();
 
@@ -423,6 +446,7 @@ namespace beckhoff_ads_hardware_interface
                     read_instruction.read_buffer_offset_data = layout.offset_in_read_response_data + index * layout.plc_element_byte_size;
                     read_instruction.plc_type = layout.plc_type;
                     read_instruction.state_interface_name = interface_name;
+                    read_instruction.state_handle = get_state_interface_handle(interface_name);
 
                     // The state interfaces' names are ordered by ascending indexes of the PLC array thanks to layout.ros2_interfaces_ being a map
                     ads_read_instructions_.push_back(read_instruction);
@@ -431,13 +455,16 @@ namespace beckhoff_ads_hardware_interface
                 current_data_offset += header.NumBytesData;
                 current_error_offset += sizeof(uint32_t);
             }
-            // One cache slot per read instruction for the reader thread. Default to NaN so read()
-            // reports "no sample yet" until the first SUM read completes. A deque keeps each slot's
-            // address stable; std::atomic<double> is neither copyable nor movable.
-            for (size_t i = 0; i < ads_read_instructions_.size(); ++i)
-            {
-                polling_read_cache_.emplace_back(std::numeric_limits<double>::quiet_NaN());
-            }
+            // NaN until the first SUM read; all slots pre-sized so the reader thread never allocates.
+            const size_t instruction_count = ads_read_instructions_.size();
+            last_decoded_values_.assign(instruction_count, std::numeric_limits<double>::quiet_NaN());
+            read_sample_buffer_.initialiseSlots(
+                [instruction_count](ReadSample &slot)
+                {
+                    slot.values.assign(instruction_count, std::numeric_limits<double>::quiet_NaN());
+                    slot.stamp = std::chrono::steady_clock::time_point{};
+                    slot.sequence = 0;
+                });
 
             RCLCPP_INFO(getLogger(), "ADS Sum READ configured for %zu items. Request: %zu bytes, Response: %zu bytes.",
                         num_items_read_, ads_buffer_sum_read_request_.size(), ads_buffer_sum_read_response_.size());
@@ -507,6 +534,10 @@ namespace beckhoff_ads_hardware_interface
                     write_instruction.fallback_state_interface_name = "";
                     write_instruction.is_heartbeat = (interface_name == HEARTBEAT_INTERFACE_NAME);
                     write_instruction.layout_index = i;
+                    if (!write_instruction.is_heartbeat)
+                    {
+                        write_instruction.command_handle = get_command_interface_handle(interface_name);
+                    }
 
                     const auto policy_it = layout.fallback_policies_.find(interface_name);
                     write_instruction.fallback = (policy_it != layout.fallback_policies_.end())
@@ -519,6 +550,7 @@ namespace beckhoff_ads_hardware_interface
                         if (state_it != layout.state_command_interfaces_map_.end())
                         {
                             write_instruction.fallback_state_interface_name = state_it->second;
+                            write_instruction.fallback_state_handle = get_state_interface_handle(state_it->second);
                         }
                         else
                         {
@@ -536,7 +568,8 @@ namespace beckhoff_ads_hardware_interface
                     }
                     else
                     {
-                        const double initial = get_command(interface_name);
+                        double initial = std::numeric_limits<double>::quiet_NaN();
+                        std::ignore = get_command(write_instruction.command_handle, initial, true);
                         if (std::isfinite(initial))
                         {
                             uint8_t *seed_destination = ads_buffer_sum_write_request_.data() +
@@ -769,18 +802,29 @@ namespace beckhoff_ads_hardware_interface
     hardware_interface::return_type BeckhoffADSHardwareInterface::read(
         const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
     {
-        // The reader thread performs the SUM read off the control loop and decodes into
-        // polling_read_cache_. Here we only publish the latest cached values.
+        // The reader thread performs the SUM read off the control loop and publishes whole
+        // decoded samples. Here we only take the latest sample and copy it out.
         if (num_items_read_ == 0)
         {
             return hardware_interface::return_type::OK;
         }
 
+        read_sample_buffer_.refreshReadSlot();
+        const ReadSample &sample = read_sample_buffer_.readSlot();
+
         for (size_t i = 0; i < ads_read_instructions_.size(); ++i)
         {
-            set_state(ads_read_instructions_[i].state_interface_name,
-                      polling_read_cache_[i].load(std::memory_order_acquire));
+            std::ignore = set_state(ads_read_instructions_[i].state_handle, sample.values[i], false);
         }
+
+        stat_read_sample_age_ms_ =
+            (sample.sequence > 0)
+                ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - sample.stamp)
+                          .count() *
+                      1e-6
+                : std::numeric_limits<double>::quiet_NaN();
+
         return read_hard_fault_.load(std::memory_order_acquire)
                    ? hardware_interface::return_type::ERROR
                    : hardware_interface::return_type::OK;
@@ -869,6 +913,7 @@ namespace beckhoff_ads_hardware_interface
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_fallback_activations_per_cycle", &stat_fallback_activations_per_cycle_);
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_never_commanded_interfaces", &stat_never_commanded_interfaces_);
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_heartbeat", &stat_heartbeat_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_read_sample_age_ms", &stat_read_sample_age_ms_);
     }
 
     void BeckhoffADSHardwareInterface::record_read_failure()
@@ -981,8 +1026,7 @@ namespace beckhoff_ads_hardware_interface
                 }
 
                 const uint8_t *ptr_plc_element_current = ads_buffer_sum_read_response_.data() + read_instruction.read_buffer_offset_data;
-                polling_read_cache_[i].store(decode_plc_element(read_instruction.plc_type, ptr_plc_element_current),
-                                             std::memory_order_release);
+                last_decoded_values_[i] = decode_plc_element(read_instruction.plc_type, ptr_plc_element_current);
             }
 
             if (items_failed == ads_read_instructions_.size() && !ads_read_instructions_.empty())
@@ -991,6 +1035,12 @@ namespace beckhoff_ads_hardware_interface
             }
             else
             {
+                ReadSample &sample = read_sample_buffer_.writeSlot();
+                sample.values = last_decoded_values_;
+                sample.stamp = std::chrono::steady_clock::now();
+                sample.sequence = ++read_sample_sequence_;
+                read_sample_buffer_.publish();
+
                 read_hard_fault_.store(false, std::memory_order_release);
                 // Declare recovery only after a stable period, so a flapping link logs once.
                 if (read_consecutive_failures_ > 0)
@@ -1048,8 +1098,12 @@ namespace beckhoff_ads_hardware_interface
             }
 
             // store the current val and reset the ros-side command value
-            double val = get_command(write_instruction.command_interface_name);
-            set_command(write_instruction.command_interface_name, std::numeric_limits<double>::quiet_NaN());
+            double val = std::numeric_limits<double>::quiet_NaN();
+            if (get_command(write_instruction.command_handle, val, false))
+            {
+                std::ignore = set_command(write_instruction.command_handle,
+                                          std::numeric_limits<double>::quiet_NaN(), false);
+            }
 
             if (!std::isnan(val))
             {
@@ -1077,9 +1131,9 @@ namespace beckhoff_ads_hardware_interface
                     val = 0.0;
                 }
                 else if (write_instruction.fallback == CommandFallback::MIRROR_STATE &&
-                         !write_instruction.fallback_state_interface_name.empty())
+                         write_instruction.fallback_state_handle)
                 {
-                    val = get_state(write_instruction.fallback_state_interface_name);
+                    std::ignore = get_state(write_instruction.fallback_state_handle, val, false);
                 }
 
                 // if we STILL don't have a fallback value on, don't update the write buffer.
@@ -1287,12 +1341,65 @@ namespace beckhoff_ads_hardware_interface
                 write_pending_ = false;
             }
             write_thread_ = std::thread(&BeckhoffADSHardwareInterface::writer_loop, this);
+            apply_io_thread_scheduling(write_thread_, "ADS writer");
         }
 
         if (num_items_read_ > 0 && !read_thread_.joinable())
         {
             read_stop_.store(false, std::memory_order_release);
             read_thread_ = std::thread(&BeckhoffADSHardwareInterface::reader_loop, this);
+            apply_io_thread_scheduling(read_thread_, "ADS reader");
+        }
+    }
+
+    void BeckhoffADSHardwareInterface::apply_io_thread_scheduling(std::thread &thread, const char *thread_name)
+    {
+        if (io_thread_scheduling_.policy != utilities::SchedulingPolicy::INHERIT)
+        {
+            int native_policy = SCHED_OTHER;
+            if (io_thread_scheduling_.policy == utilities::SchedulingPolicy::FIFO)
+            {
+                native_policy = SCHED_FIFO;
+            }
+            else if (io_thread_scheduling_.policy == utilities::SchedulingPolicy::ROUND_ROBIN)
+            {
+                native_policy = SCHED_RR;
+            }
+            sched_param scheduling_parameters{};
+            scheduling_parameters.sched_priority = io_thread_scheduling_.priority;
+            const int scheduling_error =
+                pthread_setschedparam(thread.native_handle(), native_policy, &scheduling_parameters);
+            if (scheduling_error != 0)
+            {
+                RCLCPP_WARN(getLogger(),
+                            "Could not set the %s thread scheduling (policy %d, priority %d): %s. "
+                            "The thread keeps normal scheduling; grant the process CAP_SYS_NICE or an "
+                            "rtprio limit, or set io_thread_scheduling_policy to inherit.",
+                            thread_name, native_policy, io_thread_scheduling_.priority,
+                            std::strerror(scheduling_error));
+            }
+            else
+            {
+                RCLCPP_INFO(getLogger(), "%s thread scheduling set: policy %d, priority %d.",
+                            thread_name, native_policy, io_thread_scheduling_.priority);
+            }
+        }
+
+        if (!io_thread_scheduling_.cpu_affinity.empty())
+        {
+            cpu_set_t cpu_set;
+            CPU_ZERO(&cpu_set);
+            for (const unsigned int cpu : io_thread_scheduling_.cpu_affinity)
+            {
+                CPU_SET(cpu, &cpu_set);
+            }
+            const int affinity_error =
+                pthread_setaffinity_np(thread.native_handle(), sizeof(cpu_set), &cpu_set);
+            if (affinity_error != 0)
+            {
+                RCLCPP_WARN(getLogger(), "Could not set the %s thread CPU affinity: %s.",
+                            thread_name, std::strerror(affinity_error));
+            }
         }
     }
 
