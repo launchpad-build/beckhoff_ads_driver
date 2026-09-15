@@ -231,9 +231,6 @@ namespace beckhoff_ads_hardware_interface
                         ex.what(), static_cast<long>(comms_outage_grace_.count()));
         }
 
-        // Whether a hard fault clears itself when the link recovers, or latches until the
-        // component is restarted. Latching is the default: a recovered link resuming the
-        // stream mid-outage would carry the current setpoint as a position step.
         outage_latches_ = true;
         {
             const auto behaviour_it = info_.hardware_parameters.find("outage_behaviour");
@@ -251,7 +248,6 @@ namespace beckhoff_ads_hardware_interface
             }
         }
 
-        // How old the published read sample may grow before read() surfaces an error.
         read_staleness_timeout_ns_ = 100000000;
         try
         {
@@ -274,7 +270,6 @@ namespace beckhoff_ads_hardware_interface
             read_staleness_timeout_ns_ = std::max(read_staleness_timeout_ns_, 3 * read_poll_period_ns_);
         }
 
-        // How long activation may wait for the first good sample. 0 = do not wait.
         activation_first_sample_timeout_ = std::chrono::milliseconds(1000);
         try
         {
@@ -748,7 +743,6 @@ namespace beckhoff_ads_hardware_interface
                     // Add the interface name the layout
                     (*it).ros2_interfaces_.emplace(std::make_pair(plc_index, name));
                     (*it).critical_policies_.emplace(name, interface_critical);
-                    // a symbol is only skippable if every interface on it agrees
                     (*it).optional = (*it).optional && interface_optional;
                 }
             }
@@ -809,8 +803,7 @@ namespace beckhoff_ads_hardware_interface
                 if (fallback_str.empty() && is_joint &&
                     descr.interface_info.name == hardware_interface::HW_IF_VELOCITY)
                 {
-                    // Holding the last value on a velocity command keeps a dead controller's
-                    // feed-forward alive; zero is the safe default for a motion stream.
+                    // Zero is the safe default for a velocity command.
                     fallback_policy = CommandFallback::ZERO;
                     RCLCPP_INFO(getLogger(),
                                 "Joint velocity command interface '%s' defaults to a zero fallback. "
@@ -885,7 +878,6 @@ namespace beckhoff_ads_hardware_interface
         read_samples_published_.store(0, std::memory_order_release);
         start_io_threads();
 
-        // Controllers that sample state on activation must never see the pre-first-read NaNs.
         if (num_items_read_ > 0 && activation_first_sample_timeout_.count() > 0)
         {
             const std::chrono::steady_clock::time_point deadline =
@@ -958,8 +950,6 @@ namespace beckhoff_ads_hardware_interface
             stat_read_sample_age_ms_ = std::numeric_limits<double>::quiet_NaN();
         }
 
-        // Frozen feedback must not look healthy: a controller closing a loop on a stale
-        // sample is worse than a surfaced fault.
         const bool sample_stale = read_staleness_timeout_ns_ > 0 && sample.sequence > 0 &&
                                   sample_age_ns > read_staleness_timeout_ns_;
         if (sample_stale)
@@ -1216,8 +1206,7 @@ namespace beckhoff_ads_hardware_interface
                 {
                     read_hard_fault_.store(false, std::memory_order_release);
                 }
-                // Declare recovery only after the link has been good for a stable period, so a
-                // flapping link logs one outage instead of an error/recovery pair per cycle.
+                // Declare recovery only after a stable period, so a flapping link logs once.
                 if (read_consecutive_failures_ > 0)
                 {
                     const std::chrono::steady_clock::time_point now_steady = std::chrono::steady_clock::now();
@@ -1497,8 +1486,7 @@ namespace beckhoff_ads_hardware_interface
                 {
                     write_hard_fault_.store(false, std::memory_order_release);
                 }
-                // Declare recovery only after the link has been good for a stable period, so a
-                // flapping link logs one outage instead of an error/recovery pair per round-trip.
+                // Declare recovery only after a stable period, so a flapping link logs once.
                 if (write_consecutive_failures_ > 0)
                 {
                     const std::chrono::steady_clock::time_point now_steady = std::chrono::steady_clock::now();
@@ -1707,9 +1695,7 @@ namespace beckhoff_ads_hardware_interface
             ads_read_device_ = std::make_unique<AdsDevice>(plc_ip, remote_net_id, plc_ams_port);
             ads_write_device_ = std::make_unique<AdsDevice>(plc_ip, remote_net_id, plc_ams_port);
 
-            // A blocking ADS call bounds how long stop_io_threads and outage detection can
-            // stall, so the default request timeout drops from the library's 5000 ms to a
-            // small multiple of a healthy round trip. 0 keeps the library default.
+            // Bounds how long a blocking ADS call can stall stop_io_threads; 0 keeps the library default.
             uint32_t request_timeout_ms = 100;
             const auto timeout_it = params.find("ads_request_timeout_ms");
             if (timeout_it != params.end())

@@ -87,16 +87,12 @@ namespace beckhoff_ads_hardware_interface
     // For interfaces targeting the same PLC symbol, store all their names with their corresponding index inside a map. This will be useful when calling thr ROS2 set_state and set_command functions.
     std::map<size_t, std::string> ros2_interfaces_;
 
-    // Per-interface command_fallback, parsed from the interface parameters.
     std::map<std::string, CommandFallback> fallback_policies_;
 
-    // Per state interface: a critical item failing beyond the grace window is a hard fault
-    // instead of freezing silently. Joint position and velocity default to critical; the
-    // critical interface parameter overrides either way.
+    // Joint position and velocity default to critical; the critical interface parameter overrides.
     std::map<std::string, bool> critical_policies_;
 
-    // True when every interface on this symbol declared optional="true". An optional symbol
-    // the PLC does not have is dropped with a warning; a required one fails configure.
+    // True only when every interface on this symbol declared optional="true".
     bool optional = false;
     bool handle_resolved = false;
   };
@@ -117,8 +113,6 @@ namespace beckhoff_ads_hardware_interface
     std::string state_interface_name;
     // Resolved once at configure so read() stays non-blocking on the control loop.
     hardware_interface::StateInterface::SharedPtr state_handle;
-    // A critical item whose per-item read keeps failing beyond the grace window hard-faults
-    // the component; a non-critical one holds its last value and logs, as before.
     bool critical = false;
   };
 
@@ -153,8 +147,6 @@ namespace beckhoff_ads_hardware_interface
     std::vector<uint8_t> buffer;
     std::vector<size_t> layout_indices; // original layout index of each item in the buffer
     size_t num_items = 0;
-    // When write() handed this buffer over. The round-trip time alone hides the queueing
-    // delay a setpoint suffers before the send even starts; this stamp exposes it.
     std::chrono::steady_clock::time_point handoff_stamp{};
   };
 
@@ -253,28 +245,16 @@ namespace beckhoff_ads_hardware_interface
     // A link must stay good this long before an outage is declared over.
     static constexpr std::chrono::seconds RECOVERY_STABLE_PERIOD{1};
 
-    // A comms outage shorter than this is ridden out on the last cached values; only once it
-    // outlives the window does read()/write() surface an error and let the controller manager
-    // tear the stack down. Overridable via the comms_outage_grace_ms hardware parameter. The
-    // default suits a motion stream: it matches the PLC's own ROS link watchdog, so ROS
-    // notices a dead link no later than the machine stops. Telemetry stacks can raise it.
+    // Overridable via comms_outage_grace_ms; the default matches the PLC's ROS link watchdog.
     std::chrono::milliseconds comms_outage_grace_{100};
 
-    // With latching (the default) a hard fault survives link recovery, so the component
-    // faults and is restarted deliberately instead of resuming the stream with a silent
-    // position step of up to velocity times outage. outage_behaviour=resume restores the
-    // self-clearing behaviour, which suits hold-last telemetry and GPIO stacks.
+    // outage_behaviour=resume lets a hard fault clear itself on link recovery.
     bool outage_latches_{true};
 
-    // read() returns an error once the published sample is older than this, so a controller
-    // cannot close a loop on frozen feedback while everything reports healthy. Overridable
-    // via read_staleness_timeout_ms; 0 disables. Raised to three read poll periods when
-    // paced reading is slower than the configured value.
+    // Overridable via read_staleness_timeout_ms; 0 disables; raised to three poll periods when paced reading is slower.
     long long read_staleness_timeout_ns_{100000000};
 
-    // How long on_activate may wait for the first good sample before failing activation,
-    // so early read() calls never publish NaN into controllers that sample state when they
-    // activate. Overridable via activation_first_sample_timeout_ms; 0 skips the wait.
+    // Overridable via activation_first_sample_timeout_ms; 0 skips the wait.
     std::chrono::milliseconds activation_first_sample_timeout_{1000};
     std::atomic<uint64_t> read_samples_published_{0}; // bumped by the reader on every publish
 
