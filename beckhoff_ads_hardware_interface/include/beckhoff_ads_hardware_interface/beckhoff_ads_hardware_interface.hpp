@@ -23,6 +23,7 @@
 #include <vector>
 #include <limits>
 
+#include "hardware_interface/introspection.hpp"
 #include "hardware_interface/system_interface.hpp"
 #include "hardware_interface/handle.hpp"
 #include "hardware_interface/hardware_info.hpp"
@@ -52,6 +53,13 @@ namespace beckhoff_ads_hardware_interface
     STRING,
   };
 
+  enum class CommandFallback
+  {
+    HOLD_LAST,    // keep whatever was packed on the last cycle that carried a command
+    MIRROR_STATE, // send the state interface sharing this PLC symbol, so the target tracks reality
+    ZERO,         // send zero; the right answer for a velocity or effort command
+  };
+
   // Describes each PLC item (array or single variable) for polling via sum commands.
   struct ADSDataLayout
   {
@@ -77,6 +85,12 @@ namespace beckhoff_ads_hardware_interface
 
     // For interfaces targeting the same PLC symbol, store all their names with their corresponding index inside a map. This will be useful when calling thr ROS2 set_state and set_command functions.
     std::map<size_t, std::string> ros2_interfaces_;
+
+    std::map<std::string, CommandFallback> fallback_policies_;
+
+    // True only when every interface on this symbol declared optional="true".
+    bool optional = false;
+    bool handle_resolved = false;
   };
 
   // Packed header for sum read/write request item headers
@@ -101,6 +115,8 @@ namespace beckhoff_ads_hardware_interface
     PLCType plc_type;
     std::string command_interface_name;
     std::string fallback_state_interface_name; // The state interface name corresponding to the current command interface name
+    CommandFallback fallback = CommandFallback::HOLD_LAST;
+    bool is_heartbeat = false; // value comes from the interface's own counter, not a controller
   };
 
   class BeckhoffADSHardwareInterface : public hardware_interface::SystemInterface
@@ -141,6 +157,15 @@ namespace beckhoff_ads_hardware_interface
     static const char *adsErrorText(long error_code);
 
     /**
+     * @brief Parses a command_fallback interface parameter into its enum
+     *
+     * @param policy_str Parameter text: hold_last, mirror_state or zero
+     * @param interface_name Interface the parameter belongs to, for the warning on a bad value
+     * @returns The matching policy, or HOLD_LAST when the text is empty or unrecognised
+     */
+    CommandFallback parseCommandFallback(const std::string &policy_str, const std::string &interface_name);
+
+    /**
      * @brief Records a failed SUM-read round-trip for outage and recovery logs
      *
      * Stamps the outage start on the first failure and resets recovery tracking.
@@ -155,6 +180,12 @@ namespace beckhoff_ads_hardware_interface
      * Writer thread only.
      */
     void record_write_failure();
+
+    // Synthetic heartbeat name, never exported to ros2_control.
+    static constexpr const char *HEARTBEAT_INTERFACE_NAME = "__ads_link_heartbeat";
+
+    std::string heartbeat_symbol_;        // PLC symbol to beat on; empty disables the heartbeat
+    uint32_t heartbeat_counter_{0};       // advanced in write(), so control-loop thread only
 
     // Connection target details kept for error logs (populated in configure_ads_device).
     std::string plc_ip_address_;
@@ -201,6 +232,37 @@ namespace beckhoff_ads_hardware_interface
     std::vector<uint8_t> ads_buffer_sum_write_request_;
     std::vector<uint8_t> ads_buffer_sum_write_response_;
     size_t num_items_write_ = 0;
+
+    /**
+     * @brief Copies the I/O threads' counters into the introspected mirrors
+     */
+    void refresh_transaction_statistics();
+
+    /**
+     * @brief Registers the ADS transaction statistics with the ros2_control introspection
+     */
+    void register_transaction_statistics();
+
+    // ===== ADS transaction statistics ==========================================
+    std::atomic<long long> read_rtt_ns_{0};
+    std::atomic<long long> write_rtt_ns_{0};
+    std::atomic<uint64_t> read_transactions_total_{0};
+    std::atomic<uint64_t> write_transactions_total_{0};
+    std::atomic<uint64_t> write_coalesced_total_{0};
+    std::atomic<uint64_t> read_failures_total_{0};
+    std::atomic<uint64_t> write_failures_total_{0};
+    std::atomic<uint64_t> fallback_activations_{0};
+
+    // Introspected mirrors. Only the control loop writes these.
+    double stat_read_rtt_ms_{0.0};
+    double stat_write_rtt_ms_{0.0};
+    double stat_read_transactions_{0.0};
+    double stat_write_transactions_{0.0};
+    double stat_write_coalesced_{0.0};
+    double stat_read_failures_{0.0};
+    double stat_write_failures_{0.0};
+    double stat_fallback_activations_{0.0};
+    double stat_heartbeat_{0.0};
 
     std::vector<ReadInstruction> ads_read_instructions_;
     std::vector<WriteInstruction> ads_write_instructions_;

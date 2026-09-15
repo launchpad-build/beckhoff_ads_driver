@@ -138,6 +138,14 @@ namespace beckhoff_ads_hardware_interface
             RCLCPP_WARN(getLogger(), "Invalid read_poll_period_ms: %s. Running unpaced.", ex.what());
         }
 
+        heartbeat_symbol_.clear();
+        auto heartbeat_it = info_.hardware_parameters.find("heartbeat_plc_symbol");
+        if (heartbeat_it != info_.hardware_parameters.end() && !heartbeat_it->second.empty())
+        {
+            heartbeat_symbol_ = heartbeat_it->second;
+            RCLCPP_INFO(getLogger(), "ADS link heartbeat enabled on PLC symbol '%s'.", heartbeat_symbol_.c_str());
+        }
+
         // Configure ADS Client Device
         if (!configure_ads_device())
         {
@@ -151,43 +159,58 @@ namespace beckhoff_ads_hardware_interface
 
         // Request handles for all symbolic PLC variable names
         RCLCPP_INFO(getLogger(), "Fetching ADS handles for configured PLC variables...");
-        for (auto &layout : ads_item_layouts_read_)
+        bool required_symbol_missing = false;
+
+        auto resolve_handles = [&](std::vector<ADSDataLayout> &layouts, const char *direction)
         {
-            try
+            for (auto &layout : layouts)
             {
-                layout.ads_handle_owner.emplace(ads_device_->GetHandle(layout.plc_name_symbolic));
-                layout.ads_handle = **layout.ads_handle_owner;
+                try
+                {
+                    layout.ads_handle_owner.emplace(ads_device_->GetHandle(layout.plc_name_symbolic));
+                    layout.ads_handle = **layout.ads_handle_owner;
+                    layout.handle_resolved = true;
+                }
+                catch (const std::exception &ex)
+                {
+                    layout.handle_resolved = false;
+                    if (layout.optional)
+                    {
+                        RCLCPP_WARN(getLogger(),
+                                    "\tOptional %s symbol '%s' is not on the PLC (%s). Skipping it; its interfaces keep their initial value.",
+                                    direction, layout.plc_name_symbolic.c_str(), ex.what());
+                    }
+                    else
+                    {
+                        RCLCPP_FATAL(getLogger(),
+                                     "\tRequired %s symbol '%s' is not on the PLC (%s). Flash the PLC project first, or mark the interface optional.",
+                                     direction, layout.plc_name_symbolic.c_str(), ex.what());
+                        required_symbol_missing = true;
+                    }
+                }
             }
-            catch (const std::exception &ex)
+
+            // ADSDataLayout is not move-assignable, so no erase-remove here.
+            std::vector<ADSDataLayout> resolved;
+            resolved.reserve(layouts.size());
+            for (auto &layout : layouts)
             {
-                RCLCPP_ERROR(getLogger(), "\tADS Exception getting handle for '%s': %s. Read operations for this variable will fail.", layout.plc_name_symbolic.c_str(), ex.what());
+                if (layout.handle_resolved)
+                {
+                    resolved.push_back(std::move(layout));
+                }
             }
-        }
-        for (auto &layout : ads_item_layouts_write_)
+            layouts = std::move(resolved);
+        };
+
+        resolve_handles(ads_item_layouts_read_, "read");
+        resolve_handles(ads_item_layouts_write_, "write");
+
+        if (required_symbol_missing)
         {
-            try
-            {
-                layout.ads_handle_owner.emplace(ads_device_->GetHandle(layout.plc_name_symbolic));
-                layout.ads_handle = **layout.ads_handle_owner;
-            }
-            catch (const std::exception &ex)
-            {
-                RCLCPP_ERROR(getLogger(), "\tADS Exception getting handle for '%s': %s. Write operations for this variable will fail.", layout.plc_name_symbolic.c_str(), ex.what());
-            }
+            return hardware_interface::CallbackReturn::ERROR;
         }
         RCLCPP_INFO(getLogger(), "\tHandles acquired");
-
-        // Pre-pack what we can for SUM read/write commands
-        if (!build_sum_read_buffers())
-        {
-            RCLCPP_FATAL(getLogger(), "\tFailed to build ADS sum read buffer.");
-            return hardware_interface::CallbackReturn::ERROR;
-        }
-        if (!build_sum_write_buffers())
-        {
-            RCLCPP_FATAL(getLogger(), "\tFailed to build ADS sum write buffer.");
-            return hardware_interface::CallbackReturn::ERROR;
-        }
 
         // Link command interfaces to their corresponding state interfaces
         RCLCPP_INFO(getLogger(), "Linking command interfaces to state interfaces...");
@@ -199,12 +222,29 @@ namespace beckhoff_ads_hardware_interface
                 {
                     for (size_t k = 0; k < command_layout.num_elements; ++k)
                     {
-                        // The pair is made of (command_interface_name, corresponding_state_interface_name)
-                        auto pair = std::make_pair(command_layout.ros2_interfaces_.find(k)->second, state_layout.ros2_interfaces_.find(k)->second);
-                        command_layout.state_command_interfaces_map_.emplace(pair);
+                        const auto command_it = command_layout.ros2_interfaces_.find(k);
+                        const auto state_it = state_layout.ros2_interfaces_.find(k);
+                        if (command_it == command_layout.ros2_interfaces_.end() ||
+                            state_it == state_layout.ros2_interfaces_.end())
+                        {
+                            continue; // sparse array indices: this element has no matching pair
+                        }
+                        command_layout.state_command_interfaces_map_.emplace(command_it->second, state_it->second);
                     }
                 }
             }
+        }
+
+        // Pre-pack what we can for SUM read/write commands
+        if (!build_sum_read_buffers())
+        {
+            RCLCPP_FATAL(getLogger(), "\tFailed to build ADS sum read buffer.");
+            return hardware_interface::CallbackReturn::ERROR;
+        }
+        if (!build_sum_write_buffers())
+        {
+            RCLCPP_FATAL(getLogger(), "\tFailed to build ADS sum write buffer.");
+            return hardware_interface::CallbackReturn::ERROR;
         }
 
         return CallbackReturn::SUCCESS;
@@ -317,11 +357,28 @@ namespace beckhoff_ads_hardware_interface
                 write_instruction.plc_type = layout.plc_type;
                 write_instruction.command_interface_name = interface_name;
                 write_instruction.fallback_state_interface_name = "";
+                write_instruction.is_heartbeat = (interface_name == HEARTBEAT_INTERFACE_NAME);
 
-                // There exists a state interface for the same PLC symbol
-                if (!layout.state_command_interfaces_map_.empty())
+                const auto policy_it = layout.fallback_policies_.find(interface_name);
+                write_instruction.fallback = (policy_it != layout.fallback_policies_.end())
+                                                 ? policy_it->second
+                                                 : CommandFallback::HOLD_LAST;
+
+                if (write_instruction.fallback == CommandFallback::MIRROR_STATE)
                 {
-                    write_instruction.fallback_state_interface_name = layout.state_command_interfaces_map_.find(interface_name)->second;
+                    const auto state_it = layout.state_command_interfaces_map_.find(interface_name);
+                    if (state_it != layout.state_command_interfaces_map_.end())
+                    {
+                        write_instruction.fallback_state_interface_name = state_it->second;
+                    }
+                    else
+                    {
+                        RCLCPP_WARN(getLogger(),
+                                    "Command interface '%s' asks for a mirror_state fallback but no state interface "
+                                    "shares its PLC symbol. Holding the last value instead.",
+                                    interface_name.c_str());
+                        write_instruction.fallback = CommandFallback::HOLD_LAST;
+                    }
                 }
 
                 // The command interfaces' names are ordered by ascending indexes of the PLC array thanks to layout.ros2_interfaces_ being a map
@@ -378,6 +435,9 @@ namespace beckhoff_ads_hardware_interface
                     continue;
                 }
 
+                const bool interface_optional = descr.interface_info.parameters.count("optional") &&
+                                                descr.interface_info.parameters.at("optional") == "true";
+
                 // If this is the first time we see this symbol, create the layout
                 if (processed_plc_symbols.find(plc_symbol) == processed_plc_symbols.end())
                 {
@@ -386,6 +446,7 @@ namespace beckhoff_ads_hardware_interface
                     layout.num_elements = num_elements;
                     layout.plc_type = strToPlcType(plc_type_str);
                     layout.ros2_interfaces_.emplace(std::make_pair(plc_index, name));
+                    layout.optional = interface_optional;
 
                     if (layout.plc_type == PLCType::UNKNOWN || layout.plc_type == PLCType::STRING)
                     {
@@ -408,6 +469,7 @@ namespace beckhoff_ads_hardware_interface
 
                     // Add the interface name the layout
                     (*it).ros2_interfaces_.emplace(std::make_pair(plc_index, name));
+                    (*it).optional = (*it).optional && interface_optional;
                 }
             }
         };
@@ -477,6 +539,15 @@ namespace beckhoff_ads_hardware_interface
                     continue;
                 }
 
+                std::string fallback_str;
+                if (descr.interface_info.parameters.count("command_fallback"))
+                {
+                    fallback_str = descr.interface_info.parameters.at("command_fallback");
+                }
+                const CommandFallback fallback_policy = parseCommandFallback(fallback_str, name);
+                const bool interface_optional = descr.interface_info.parameters.count("optional") &&
+                                                descr.interface_info.parameters.at("optional") == "true";
+
                 if (processed_plc_symbols.find(plc_symbol) == processed_plc_symbols.end())
                 {
                     ADSDataLayout layout;
@@ -484,6 +555,8 @@ namespace beckhoff_ads_hardware_interface
                     layout.num_elements = num_elements;
                     layout.plc_type = strToPlcType(plc_type_str);
                     layout.ros2_interfaces_.emplace(std::make_pair(plc_index, name));
+                    layout.fallback_policies_.emplace(name, fallback_policy);
+                    layout.optional = interface_optional;
 
                     if (layout.plc_type == PLCType::UNKNOWN || layout.plc_type == PLCType::STRING)
                     {
@@ -506,17 +579,31 @@ namespace beckhoff_ads_hardware_interface
 
                     // Add the command interface name the layout
                     (*it).ros2_interfaces_.emplace(std::make_pair(plc_index, name));
+                    (*it).fallback_policies_.emplace(name, fallback_policy);
+                    (*it).optional = (*it).optional && interface_optional;
                 }
             }
         };
 
         init_ads_write_layout(joint_command_interfaces_);
         init_ads_write_layout(gpio_command_interfaces_);
+
+        if (!heartbeat_symbol_.empty())
+        {
+            ADSDataLayout layout;
+            layout.plc_name_symbolic = heartbeat_symbol_;
+            layout.num_elements = 1;
+            layout.plc_type = PLCType::UDINT;
+            layout.plc_element_byte_size = plcTypeByteSize(PLCType::UDINT);
+            layout.ros2_interfaces_.emplace(0, HEARTBEAT_INTERFACE_NAME);
+            ads_item_layouts_write_.push_back(std::move(layout));
+        }
     }
 
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_activate(
         const rclcpp_lifecycle::State & /*previous_state*/)
     {
+        register_transaction_statistics();
         start_io_threads();
         return CallbackReturn::SUCCESS;
     }
@@ -578,8 +665,59 @@ namespace beckhoff_ads_hardware_interface
         return text;
     }
 
+    CommandFallback BeckhoffADSHardwareInterface::parseCommandFallback(
+        const std::string &policy_str, const std::string &interface_name)
+    {
+        CommandFallback result = CommandFallback::HOLD_LAST;
+
+        if (policy_str == "mirror_state")
+        {
+            result = CommandFallback::MIRROR_STATE;
+        }
+        else if (policy_str == "zero")
+        {
+            result = CommandFallback::ZERO;
+        }
+        else if (!policy_str.empty() && policy_str != "hold_last")
+        {
+            RCLCPP_WARN(getLogger(),
+                        "Unknown command_fallback '%s' on interface '%s'. Expected hold_last, mirror_state or zero. "
+                        "Holding the last value.",
+                        policy_str.c_str(), interface_name.c_str());
+        }
+
+        return result;
+    }
+
+    void BeckhoffADSHardwareInterface::refresh_transaction_statistics()
+    {
+        stat_read_rtt_ms_ = static_cast<double>(read_rtt_ns_.load(std::memory_order_relaxed)) * 1e-6;
+        stat_write_rtt_ms_ = static_cast<double>(write_rtt_ns_.load(std::memory_order_relaxed)) * 1e-6;
+        stat_read_transactions_ = static_cast<double>(read_transactions_total_.load(std::memory_order_relaxed));
+        stat_write_transactions_ = static_cast<double>(write_transactions_total_.load(std::memory_order_relaxed));
+        stat_write_coalesced_ = static_cast<double>(write_coalesced_total_.load(std::memory_order_relaxed));
+        stat_read_failures_ = static_cast<double>(read_failures_total_.load(std::memory_order_relaxed));
+        stat_write_failures_ = static_cast<double>(write_failures_total_.load(std::memory_order_relaxed));
+        stat_fallback_activations_ = static_cast<double>(fallback_activations_.load(std::memory_order_relaxed));
+        stat_heartbeat_ = static_cast<double>(heartbeat_counter_);
+    }
+
+    void BeckhoffADSHardwareInterface::register_transaction_statistics()
+    {
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_read_rtt_ms", &stat_read_rtt_ms_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_write_rtt_ms", &stat_write_rtt_ms_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_read_transactions", &stat_read_transactions_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_write_transactions", &stat_write_transactions_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_write_coalesced", &stat_write_coalesced_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_read_failures", &stat_read_failures_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_write_failures", &stat_write_failures_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_fallback_activations", &stat_fallback_activations_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_heartbeat", &stat_heartbeat_);
+    }
+
     void BeckhoffADSHardwareInterface::record_read_failure()
     {
+        read_failures_total_.fetch_add(1, std::memory_order_relaxed);
         if (read_consecutive_failures_ == 0)
         {
             read_outage_start_ = std::chrono::steady_clock::now();
@@ -590,6 +728,7 @@ namespace beckhoff_ads_hardware_interface
 
     void BeckhoffADSHardwareInterface::record_write_failure()
     {
+        write_failures_total_.fetch_add(1, std::memory_order_relaxed);
         if (write_consecutive_failures_ == 0)
         {
             write_outage_start_ = std::chrono::steady_clock::now();
@@ -609,8 +748,19 @@ namespace beckhoff_ads_hardware_interface
 
             // Only the reader touches the read response buffer, so decode happens outside the
             // lock; the lock only guards the shared single-port round-trip against the writer.
+            // Let a pending setpoint take the shared port first.
+            {
+                std::unique_lock<std::mutex> write_lock(write_mutex_);
+                if (write_pending_)
+                {
+                    write_lock.unlock();
+                    std::this_thread::yield();
+                }
+            }
+
             uint32_t bytes_read_from_plc = 0;
             long ads_sum_read_error;
+            const auto read_rtt_start = std::chrono::steady_clock::now();
             {
                 std::lock_guard<std::mutex> io_lock(ads_io_mutex_);
                 ads_sum_read_error = ads_device_->ReadWriteReqEx2(
@@ -622,6 +772,12 @@ namespace beckhoff_ads_hardware_interface
                     ads_buffer_sum_read_request_.data(),
                     &bytes_read_from_plc);
             }
+            read_rtt_ns_.store(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - read_rtt_start)
+                    .count(),
+                std::memory_order_relaxed);
+            read_transactions_total_.fetch_add(1, std::memory_order_relaxed);
 
             if (ads_sum_read_error != ADSERR_NOERR)
             {
@@ -723,6 +879,13 @@ namespace beckhoff_ads_hardware_interface
         {
             uint8_t *ptr_write_buffer_destination_current = ads_buffer_sum_write_request_.data() + write_instruction.write_buffer_offset_data;
 
+            if (write_instruction.is_heartbeat)
+            {
+                const uint32_t beat = ++heartbeat_counter_;
+                memcpy(ptr_write_buffer_destination_current, &beat, sizeof(beat));
+                continue;
+            }
+
             // TODO: performance - Hoist the switch/case above for loop?
 
             // store the current val and reset the ros-side command value
@@ -731,8 +894,14 @@ namespace beckhoff_ads_hardware_interface
 
             if (std::isnan(val))
             {
-                // if the original value was NaN and there exist a state interface of the same name, write corresponding state interface
-                if (!write_instruction.fallback_state_interface_name.empty())
+                fallback_activations_.fetch_add(1, std::memory_order_relaxed);
+
+                if (write_instruction.fallback == CommandFallback::ZERO)
+                {
+                    val = 0.0;
+                }
+                else if (write_instruction.fallback == CommandFallback::MIRROR_STATE &&
+                         !write_instruction.fallback_state_interface_name.empty())
                 {
                     val = get_state(write_instruction.fallback_state_interface_name);
                 }
@@ -822,11 +991,17 @@ namespace beckhoff_ads_hardware_interface
             }
         }
 
+        refresh_transaction_statistics();
+
         // Hand the freshly packed request to the writer thread and return immediately. A newer
         // buffer overwrites one not yet sent, so the writer never backlogs (only the latest
         // setpoints matter).
         {
             std::lock_guard<std::mutex> lock(write_mutex_);
+            if (write_pending_)
+            {
+                write_coalesced_total_.fetch_add(1, std::memory_order_relaxed);
+            }
             write_pending_request_ = ads_buffer_sum_write_request_;
             write_pending_ = true;
         }
@@ -861,6 +1036,7 @@ namespace beckhoff_ads_hardware_interface
             // the writer take the port, so it is not starved by the continuous reader.
             uint32_t bytes_response_buffer_from_plc = 0;
             long ads_sum_write_error;
+            const auto write_rtt_start = std::chrono::steady_clock::now();
             {
                 std::lock_guard<std::mutex> io_lock(ads_io_mutex_);
                 ads_sum_write_error = ads_device_->ReadWriteReqEx2(
@@ -872,6 +1048,12 @@ namespace beckhoff_ads_hardware_interface
                     send_buffer.data(),
                     &bytes_response_buffer_from_plc);
             }
+            write_rtt_ns_.store(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - write_rtt_start)
+                    .count(),
+                std::memory_order_relaxed);
+            write_transactions_total_.fetch_add(1, std::memory_order_relaxed);
 
             if (ads_sum_write_error != ADSERR_NOERR)
             {
