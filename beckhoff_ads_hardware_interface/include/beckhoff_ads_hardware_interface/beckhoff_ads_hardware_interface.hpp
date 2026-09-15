@@ -108,8 +108,7 @@ namespace beckhoff_ads_hardware_interface
     size_t read_buffer_offset_data;
     PLCType plc_type;
     std::string state_interface_name;
-    // Resolved once at configure so read() never does a string lookup, takes a blocking
-    // wait or hits a throwing path on the control loop.
+    // Resolved once at configure so read() stays non-blocking on the control loop.
     hardware_interface::StateInterface::SharedPtr state_handle;
   };
 
@@ -125,14 +124,12 @@ namespace beckhoff_ads_hardware_interface
     // An unseeded field keeps its whole item out of the transmitted request.
     bool seeded = false;
     size_t layout_index = 0; // index of the owning layout in ads_item_layouts_write_
-    // Resolved once at configure so write() never does a string lookup, takes a blocking
-    // wait or hits a throwing path on the control loop. Null for the heartbeat.
+    // Resolved once at configure so write() stays non-blocking. Null for the heartbeat.
     hardware_interface::CommandInterface::SharedPtr command_handle;
     hardware_interface::StateInterface::SharedPtr fallback_state_handle;
   };
 
-  // One whole decoded SUM-read sample, published atomically so a control cycle never
-  // mixes values from two different reads. The stamp tells consumers how old it is.
+  // One whole decoded SUM-read sample.
   struct ReadSample
   {
     std::vector<double> values; // one per read instruction, in instruction order
@@ -351,18 +348,12 @@ namespace beckhoff_ads_hardware_interface
     /**
      * @brief Applies the configured scheduling policy, priority and affinity to a thread
      *
-     * Failures are warned about and left non-fatal, so a process without the
-     * real-time capability still runs with normal scheduling.
-     *
      * @param thread The I/O thread to reschedule
      * @param thread_name Human-readable thread name for the log messages
      */
     void apply_io_thread_scheduling(std::thread &thread, const char *thread_name);
 
-    // Scheduling applied to both I/O threads. Defaults to SCHED_FIFO at priority 50, so a
-    // wake after the write notify is not at the mercy of time-sharing. Overridable through
-    // the io_thread_scheduling_policy, io_thread_priority and io_thread_cpu_affinity
-    // hardware parameters; policy inherit restores plain std::thread behaviour.
+    // Overridable via the io_thread_scheduling_policy, io_thread_priority and io_thread_cpu_affinity parameters.
     utilities::ThreadSchedulingConfig io_thread_scheduling_;
 
     // Writer thread: owns the SUM-write round-trip. write() marshals the latest command
@@ -386,8 +377,6 @@ namespace beckhoff_ads_hardware_interface
     std::thread read_thread_;
     std::atomic<bool> read_stop_{false};
     std::atomic<bool> read_hard_fault_{false};      // outage outlived the grace window, surfaced by read()
-    // Whole-sample hand-over from the reader thread to read(). The reader keeps its own
-    // last-good values so a per-item failure holds that item while the rest stay live.
     utilities::LatestSampleBuffer<ReadSample> read_sample_buffer_;
     std::vector<double> last_decoded_values_; // reader thread only
     uint64_t read_sample_sequence_ = 0;       // reader thread only

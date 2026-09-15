@@ -68,8 +68,7 @@ TEST(LatestSampleBuffer, InitialiseSlotsAppliesToAllThreeSlots)
   EXPECT_EQ(buffer.readSlot().size(), 4u);
 }
 
-// The reason the buffer exists: the reader must never observe a sample mixing
-// fields from two different publishes, and must never see time run backwards.
+// The reader must never see a mixed sample or time running backwards.
 TEST(LatestSampleBuffer, ConcurrentReaderSeesWholeMonotonicSamples)
 {
   utilities::LatestSampleBuffer<PairedSample> buffer;

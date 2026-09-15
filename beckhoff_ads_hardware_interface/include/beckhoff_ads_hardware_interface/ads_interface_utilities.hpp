@@ -106,10 +106,6 @@ namespace utilities
   /**
    * @brief Parses the I/O thread scheduling hardware parameters
    *
-   * Empty texts keep the defaults: SCHED_FIFO at priority 50 with no CPU
-   * pinning. A real-time priority must lie in 1 to 99; inherit and other
-   * take no priority. The affinity text is a comma-separated CPU list.
-   *
    * @param policy_text One of fifo, rr, other or inherit, or empty for the default
    * @param priority_text The real-time priority, or empty for the default
    * @param affinity_text Comma-separated CPU indices, or empty for no pinning
@@ -122,12 +118,6 @@ namespace utilities
 
   /**
    * @brief Wait-free latest-value hand-over between one writer and one reader
-   *
-   * Classic triple buffer: the writer always owns one slot, the reader always
-   * owns one slot, and the third slot sits in the control word carrying the
-   * most recently published sample. Neither side ever blocks or touches a
-   * slot the other holds, so the reader always sees a whole sample and never
-   * a mix of two, which per-element atomics cannot guarantee.
    *
    * @tparam SampleType The sample published as one unit
    */
@@ -147,8 +137,6 @@ namespace utilities
 
     /**
      * @brief Publishes the write slot as the latest sample
-     *
-     * The writer receives a fresh slot to fill next; writer thread only.
      */
     void publish()
     {
@@ -183,8 +171,6 @@ namespace utilities
 
     /**
      * @brief Applies a function to every slot, for pre-allocation at configure
-     *
-     * Only safe while no other thread touches the buffer.
      *
      * @tparam InitFunction Callable taking SampleType&
      * @param initialise The function applied to each slot

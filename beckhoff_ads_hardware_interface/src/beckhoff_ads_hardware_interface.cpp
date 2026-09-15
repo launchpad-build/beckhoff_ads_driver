@@ -231,8 +231,6 @@ namespace beckhoff_ads_hardware_interface
                         ex.what(), static_cast<long>(comms_outage_grace_.count()));
         }
 
-        // Scheduling for the I/O threads. The defaults give both threads SCHED_FIFO at
-        // priority 50; a deployment can lower, raise or disable that through the parameters.
         {
             auto param_or_empty = [this](const char *key) -> std::string
             {
@@ -457,9 +455,7 @@ namespace beckhoff_ads_hardware_interface
                 current_data_offset += header.NumBytesData;
                 current_error_offset += sizeof(uint32_t);
             }
-            // Default to NaN so read() reports "no sample yet" until the first SUM read
-            // completes. All three snapshot slots are pre-sized here so the reader thread
-            // never allocates.
+            // NaN until the first SUM read; all slots pre-sized so the reader thread never allocates.
             const size_t instruction_count = ads_read_instructions_.size();
             last_decoded_values_.assign(instruction_count, std::numeric_limits<double>::quiet_NaN());
             read_sample_buffer_.initialiseSlots(
@@ -807,8 +803,7 @@ namespace beckhoff_ads_hardware_interface
         const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
     {
         // The reader thread performs the SUM read off the control loop and publishes whole
-        // decoded samples. Here we only take the latest sample and copy it out, so every
-        // state interface comes from the same read and never from a mix of two.
+        // decoded samples. Here we only take the latest sample and copy it out.
         if (num_items_read_ == 0)
         {
             return hardware_interface::return_type::OK;
@@ -1036,8 +1031,6 @@ namespace beckhoff_ads_hardware_interface
 
             if (items_failed == ads_read_instructions_.size() && !ads_read_instructions_.empty())
             {
-                // Every symbol is unavailable though the link answered (e.g. the program was
-                // swapped): treat as an outage so the grace window still backstops it.
                 record_read_failure();
             }
             else
@@ -1049,8 +1042,7 @@ namespace beckhoff_ads_hardware_interface
                 read_sample_buffer_.publish();
 
                 read_hard_fault_.store(false, std::memory_order_release);
-                // Declare recovery only after the link has been good for a stable period, so a
-                // flapping link logs one outage instead of an error/recovery pair per cycle.
+                // Declare recovery only after a stable period, so a flapping link logs once.
                 if (read_consecutive_failures_ > 0)
                 {
                     const std::chrono::steady_clock::time_point now_steady = std::chrono::steady_clock::now();
