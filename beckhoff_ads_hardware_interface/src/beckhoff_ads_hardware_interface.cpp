@@ -17,6 +17,7 @@
 #include <thread>
 #include <algorithm> // std::transform
 
+#include "beckhoff_ads_hardware_interface/ads_interface_utilities.hpp"
 #include "beckhoff_ads_hardware_interface/beckhoff_ads_hardware_interface.hpp"
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -115,6 +116,8 @@ namespace beckhoff_ads_hardware_interface
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_configure(
         const rclcpp_lifecycle::State & /*previous_state*/)
     {
+        stop_io_threads();
+
         // Release any symbol handles from a previous configure cycle before configure_ads_device()
         // replaces ads_device_ below; the handle deleters call through ads_device_.
         release_ads_handles();
@@ -136,6 +139,24 @@ namespace beckhoff_ads_hardware_interface
         catch (const std::exception &ex)
         {
             RCLCPP_WARN(getLogger(), "Invalid read_poll_period_ms: %s. Running unpaced.", ex.what());
+        }
+
+        try
+        {
+            auto grace_it = info_.hardware_parameters.find("comms_outage_grace_ms");
+            if (grace_it != info_.hardware_parameters.end())
+            {
+                const double ms = std::stod(grace_it->second);
+                if (std::isfinite(ms) && ms >= 0.0)
+                {
+                    comms_outage_grace_ = std::chrono::milliseconds(static_cast<long long>(ms));
+                }
+            }
+        }
+        catch (const std::exception &ex)
+        {
+            RCLCPP_WARN(getLogger(), "Invalid comms_outage_grace_ms: %s. Using default %ld ms.",
+                        ex.what(), static_cast<long>(comms_outage_grace_.count()));
         }
 
         heartbeat_symbol_.clear();
@@ -252,145 +273,158 @@ namespace beckhoff_ads_hardware_interface
 
     bool BeckhoffADSHardwareInterface::build_sum_read_buffers()
     {
+        ads_read_instructions_.clear();
+        polling_read_cache_.clear();
+        ads_buffer_sum_read_request_.clear();
+        ads_buffer_sum_read_response_.clear();
+
         num_items_read_ = ads_item_layouts_read_.size();
         if (num_items_read_ == 0)
         {
             RCLCPP_INFO(getLogger(), "No items to configure for ADS Sum READ.");
-            return true;
         }
-        RCLCPP_INFO(getLogger(), "Building ADS sum READ buffer...");
-
-        size_t total_error_block_size = num_items_read_ * sizeof(uint32_t);
-        size_t total_data_block_size = 0;
-        for (const auto &layout : ads_item_layouts_read_)
+        else
         {
-            total_data_block_size += layout.plc_element_byte_size * layout.num_elements;
-        }
+            RCLCPP_INFO(getLogger(), "Building ADS sum READ buffer...");
 
-        ads_buffer_sum_read_response_.resize(total_error_block_size + total_data_block_size);
-        ads_buffer_sum_read_request_.clear();
-
-        size_t current_data_offset = 0;
-        size_t current_error_offset = 0;
-
-        for (auto &layout : ads_item_layouts_read_)
-        {
-            layout.offset_in_read_response_data = total_error_block_size + current_data_offset;
-            layout.offset_in_read_response_error = current_error_offset;
-
-            ADS_ITEM_REQ_HEADER header;
-            header.indexGroup = ADSIGRP_SYM_VALBYHND;
-            header.indexOffset = layout.ads_handle;
-            header.NumBytesData = layout.plc_element_byte_size * layout.num_elements;
-            const uint8_t *ptr = reinterpret_cast<const uint8_t *>(&header);
-            ads_buffer_sum_read_request_.insert(ads_buffer_sum_read_request_.end(), ptr, ptr + sizeof(ADS_ITEM_REQ_HEADER));
-
-            // For interfaces targeting the same PLC symbol
-            for (const auto &[index, interface_name] : layout.ros2_interfaces_)
+            size_t total_error_block_size = num_items_read_ * sizeof(uint32_t);
+            size_t total_data_block_size = 0;
+            for (const auto &layout : ads_item_layouts_read_)
             {
-                // Fill the read instruction vector
-                ReadInstruction read_instruction;
-                read_instruction.read_buffer_offset_error_code = layout.offset_in_read_response_error;
-                read_instruction.read_buffer_offset_data = layout.offset_in_read_response_data + index * layout.plc_element_byte_size;
-                read_instruction.plc_type = layout.plc_type;
-                read_instruction.state_interface_name = interface_name;
-
-                // The state interfaces' names are ordered by ascending indexes of the PLC array thanks to layout.ros2_interfaces_ being a map
-                ads_read_instructions_.push_back(read_instruction);
+                total_data_block_size += layout.plc_element_byte_size * layout.num_elements;
             }
 
-            current_data_offset += header.NumBytesData;
-            current_error_offset += sizeof(uint32_t);
-        }
-        // One cache slot per read instruction for the reader thread. Default to NaN so read()
-        // reports "no sample yet" until the first SUM read completes. A deque keeps each slot's
-        // address stable; std::atomic<double> is neither copyable nor movable.
-        polling_read_cache_.clear();
-        for (size_t i = 0; i < ads_read_instructions_.size(); ++i)
-        {
-            polling_read_cache_.emplace_back(std::numeric_limits<double>::quiet_NaN());
+            ads_buffer_sum_read_response_.resize(total_error_block_size + total_data_block_size);
+
+            size_t current_data_offset = 0;
+            size_t current_error_offset = 0;
+
+            for (auto &layout : ads_item_layouts_read_)
+            {
+                layout.offset_in_read_response_data = total_error_block_size + current_data_offset;
+                layout.offset_in_read_response_error = current_error_offset;
+
+                ADS_ITEM_REQ_HEADER header;
+                header.indexGroup = ADSIGRP_SYM_VALBYHND;
+                header.indexOffset = layout.ads_handle;
+                header.NumBytesData = layout.plc_element_byte_size * layout.num_elements;
+                const uint8_t *ptr = reinterpret_cast<const uint8_t *>(&header);
+                ads_buffer_sum_read_request_.insert(ads_buffer_sum_read_request_.end(), ptr, ptr + sizeof(ADS_ITEM_REQ_HEADER));
+
+                // For interfaces targeting the same PLC symbol
+                for (const auto &[index, interface_name] : layout.ros2_interfaces_)
+                {
+                    // Fill the read instruction vector
+                    ReadInstruction read_instruction;
+                    read_instruction.read_buffer_offset_error_code = layout.offset_in_read_response_error;
+                    read_instruction.read_buffer_offset_data = layout.offset_in_read_response_data + index * layout.plc_element_byte_size;
+                    read_instruction.plc_type = layout.plc_type;
+                    read_instruction.state_interface_name = interface_name;
+
+                    // The state interfaces' names are ordered by ascending indexes of the PLC array thanks to layout.ros2_interfaces_ being a map
+                    ads_read_instructions_.push_back(read_instruction);
+                }
+
+                current_data_offset += header.NumBytesData;
+                current_error_offset += sizeof(uint32_t);
+            }
+            // One cache slot per read instruction for the reader thread. Default to NaN so read()
+            // reports "no sample yet" until the first SUM read completes. A deque keeps each slot's
+            // address stable; std::atomic<double> is neither copyable nor movable.
+            for (size_t i = 0; i < ads_read_instructions_.size(); ++i)
+            {
+                polling_read_cache_.emplace_back(std::numeric_limits<double>::quiet_NaN());
+            }
+
+            RCLCPP_INFO(getLogger(), "ADS Sum READ configured for %zu items. Request: %zu bytes, Response: %zu bytes.",
+                        num_items_read_, ads_buffer_sum_read_request_.size(), ads_buffer_sum_read_response_.size());
         }
 
-        RCLCPP_INFO(getLogger(), "ADS Sum READ configured for %zu items. Request: %zu bytes, Response: %zu bytes.",
-                    num_items_read_, ads_buffer_sum_read_request_.size(), ads_buffer_sum_read_response_.size());
         return true;
     }
 
     bool BeckhoffADSHardwareInterface::build_sum_write_buffers()
     {
         RCLCPP_INFO(getLogger(), "Building ADS sum WRITE buffer...");
+
+        ads_write_instructions_.clear();
+        ads_buffer_sum_write_request_.clear();
+        ads_buffer_sum_write_response_.clear();
+
         num_items_write_ = ads_item_layouts_write_.size();
         if (num_items_write_ == 0)
         {
             RCLCPP_INFO(getLogger(), "No items to configure for ADS Sum WRITE.");
-            return true;
         }
-
-        size_t total_data_size = 0;
-        size_t total_header_size = num_items_write_ * sizeof(ADS_ITEM_REQ_HEADER);
-        for (const auto &layout : ads_item_layouts_write_)
+        else
         {
-            total_data_size += layout.plc_element_byte_size * layout.num_elements;
-        }
-
-        ads_buffer_sum_write_request_.resize(total_header_size + total_data_size);
-        ads_buffer_sum_write_response_.resize(num_items_write_ * sizeof(uint32_t));
-
-        auto *header_block_ptr = reinterpret_cast<ADS_ITEM_REQ_HEADER *>(ads_buffer_sum_write_request_.data());
-        size_t current_data_offset = 0;
-        size_t i = 0; // Index for the header block pointer
-
-        for (auto &layout : ads_item_layouts_write_)
-        {
-            header_block_ptr[i].indexGroup = ADSIGRP_SYM_VALBYHND;
-            header_block_ptr[i].indexOffset = layout.ads_handle;
-            header_block_ptr[i].NumBytesData = layout.plc_element_byte_size * layout.num_elements;
-
-            layout.offset_in_write_request_data = total_header_size + current_data_offset;
-
-            // For interfaces targeting the same PLC symbol
-            for (const auto &[index, interface_name] : layout.ros2_interfaces_)
+            size_t total_data_size = 0;
+            size_t total_header_size = num_items_write_ * sizeof(ADS_ITEM_REQ_HEADER);
+            for (const auto &layout : ads_item_layouts_write_)
             {
-                // Fill the write instruction vector
-                WriteInstruction write_instruction;
-                write_instruction.write_buffer_offset_data = layout.offset_in_write_request_data + index * layout.plc_element_byte_size;
-                write_instruction.plc_type = layout.plc_type;
-                write_instruction.command_interface_name = interface_name;
-                write_instruction.fallback_state_interface_name = "";
-                write_instruction.is_heartbeat = (interface_name == HEARTBEAT_INTERFACE_NAME);
-
-                const auto policy_it = layout.fallback_policies_.find(interface_name);
-                write_instruction.fallback = (policy_it != layout.fallback_policies_.end())
-                                                 ? policy_it->second
-                                                 : CommandFallback::HOLD_LAST;
-
-                if (write_instruction.fallback == CommandFallback::MIRROR_STATE)
-                {
-                    const auto state_it = layout.state_command_interfaces_map_.find(interface_name);
-                    if (state_it != layout.state_command_interfaces_map_.end())
-                    {
-                        write_instruction.fallback_state_interface_name = state_it->second;
-                    }
-                    else
-                    {
-                        RCLCPP_WARN(getLogger(),
-                                    "Command interface '%s' asks for a mirror_state fallback but no state interface "
-                                    "shares its PLC symbol. Holding the last value instead.",
-                                    interface_name.c_str());
-                        write_instruction.fallback = CommandFallback::HOLD_LAST;
-                    }
-                }
-
-                // The command interfaces' names are ordered by ascending indexes of the PLC array thanks to layout.ros2_interfaces_ being a map
-                ads_write_instructions_.push_back(write_instruction);
+                total_data_size += layout.plc_element_byte_size * layout.num_elements;
             }
 
-            current_data_offset += header_block_ptr[i].NumBytesData;
-            i++;
+            ads_buffer_sum_write_request_.resize(total_header_size + total_data_size);
+            ads_buffer_sum_write_response_.resize(num_items_write_ * sizeof(uint32_t));
+
+            auto *header_block_ptr = reinterpret_cast<ADS_ITEM_REQ_HEADER *>(ads_buffer_sum_write_request_.data());
+            size_t current_data_offset = 0;
+            size_t i = 0; // Index for the header block pointer
+
+            for (auto &layout : ads_item_layouts_write_)
+            {
+                header_block_ptr[i].indexGroup = ADSIGRP_SYM_VALBYHND;
+                header_block_ptr[i].indexOffset = layout.ads_handle;
+                header_block_ptr[i].NumBytesData = layout.plc_element_byte_size * layout.num_elements;
+
+                layout.offset_in_write_request_data = total_header_size + current_data_offset;
+
+                // For interfaces targeting the same PLC symbol
+                for (const auto &[index, interface_name] : layout.ros2_interfaces_)
+                {
+                    // Fill the write instruction vector
+                    WriteInstruction write_instruction;
+                    write_instruction.write_buffer_offset_data = layout.offset_in_write_request_data + index * layout.plc_element_byte_size;
+                    write_instruction.plc_type = layout.plc_type;
+                    write_instruction.command_interface_name = interface_name;
+                    write_instruction.fallback_state_interface_name = "";
+                    write_instruction.is_heartbeat = (interface_name == HEARTBEAT_INTERFACE_NAME);
+
+                    const auto policy_it = layout.fallback_policies_.find(interface_name);
+                    write_instruction.fallback = (policy_it != layout.fallback_policies_.end())
+                                                     ? policy_it->second
+                                                     : CommandFallback::HOLD_LAST;
+
+                    if (write_instruction.fallback == CommandFallback::MIRROR_STATE)
+                    {
+                        const auto state_it = layout.state_command_interfaces_map_.find(interface_name);
+                        if (state_it != layout.state_command_interfaces_map_.end())
+                        {
+                            write_instruction.fallback_state_interface_name = state_it->second;
+                        }
+                        else
+                        {
+                            RCLCPP_WARN(getLogger(),
+                                        "Command interface '%s' asks for a mirror_state fallback but no state interface "
+                                        "shares its PLC symbol. Holding the last value instead.",
+                                        interface_name.c_str());
+                            write_instruction.fallback = CommandFallback::HOLD_LAST;
+                        }
+                    }
+
+                    // The command interfaces' names are ordered by ascending indexes of the PLC array thanks to layout.ros2_interfaces_ being a map
+                    ads_write_instructions_.push_back(write_instruction);
+                }
+
+                current_data_offset += header_block_ptr[i].NumBytesData;
+                i++;
+            }
+
+            RCLCPP_INFO(getLogger(), "ADS Sum WRITE configured for %zu items. Request: %zu bytes, Response: %zu bytes.",
+                        num_items_write_, ads_buffer_sum_write_request_.size(), ads_buffer_sum_write_response_.size());
         }
 
-        RCLCPP_INFO(getLogger(), "ADS Sum WRITE configured for %zu items. Request: %zu bytes, Response: %zu bytes.",
-                    num_items_write_, ads_buffer_sum_write_request_.size(), ads_buffer_sum_write_response_.size());
         return true;
     }
 
@@ -631,9 +665,9 @@ namespace beckhoff_ads_hardware_interface
             set_state(ads_read_instructions_[i].state_interface_name,
                       polling_read_cache_[i].load(std::memory_order_acquire));
         }
-        return read_comms_ok_.load(std::memory_order_acquire)
-                   ? hardware_interface::return_type::OK
-                   : hardware_interface::return_type::ERROR;
+        return read_hard_fault_.load(std::memory_order_acquire)
+                   ? hardware_interface::return_type::ERROR
+                   : hardware_interface::return_type::OK;
     }
 
     const char *BeckhoffADSHardwareInterface::adsErrorText(long error_code)
@@ -699,6 +733,10 @@ namespace beckhoff_ads_hardware_interface
         stat_read_failures_ = static_cast<double>(read_failures_total_.load(std::memory_order_relaxed));
         stat_write_failures_ = static_cast<double>(write_failures_total_.load(std::memory_order_relaxed));
         stat_fallback_activations_ = static_cast<double>(fallback_activations_.load(std::memory_order_relaxed));
+        stat_fallback_activations_per_cycle_ =
+            static_cast<double>(fallback_activations_cycle_.load(std::memory_order_relaxed));
+        stat_never_commanded_interfaces_ =
+            static_cast<double>(never_commanded_interfaces_.load(std::memory_order_relaxed));
         stat_heartbeat_ = static_cast<double>(heartbeat_counter_);
     }
 
@@ -712,29 +750,41 @@ namespace beckhoff_ads_hardware_interface
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_read_failures", &stat_read_failures_);
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_write_failures", &stat_write_failures_);
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_fallback_activations", &stat_fallback_activations_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_fallback_activations_per_cycle", &stat_fallback_activations_per_cycle_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_never_commanded_interfaces", &stat_never_commanded_interfaces_);
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_heartbeat", &stat_heartbeat_);
     }
 
     void BeckhoffADSHardwareInterface::record_read_failure()
     {
+        const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
         read_failures_total_.fetch_add(1, std::memory_order_relaxed);
         if (read_consecutive_failures_ == 0)
         {
-            read_outage_start_ = std::chrono::steady_clock::now();
+            read_outage_start_ = now;
         }
         ++read_consecutive_failures_;
         read_recovery_stable_since_.reset();
+        if (now - read_outage_start_ >= comms_outage_grace_)
+        {
+            read_hard_fault_.store(true, std::memory_order_release);
+        }
     }
 
     void BeckhoffADSHardwareInterface::record_write_failure()
     {
+        const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
         write_failures_total_.fetch_add(1, std::memory_order_relaxed);
         if (write_consecutive_failures_ == 0)
         {
-            write_outage_start_ = std::chrono::steady_clock::now();
+            write_outage_start_ = now;
         }
         ++write_consecutive_failures_;
         write_recovery_stable_since_.reset();
+        if (now - write_outage_start_ >= comms_outage_grace_)
+        {
+            write_hard_fault_.store(true, std::memory_order_release);
+        }
     }
 
     void BeckhoffADSHardwareInterface::reader_loop()
@@ -795,7 +845,6 @@ namespace beckhoff_ads_hardware_interface
                                           ads_sum_read_error, adsErrorText(ads_sum_read_error));
                 }
                 record_read_failure();
-                read_comms_ok_.store(false, std::memory_order_release);
                 std::this_thread::sleep_for(ERROR_BACKOFF);
                 continue;
             }
@@ -806,34 +855,12 @@ namespace beckhoff_ads_hardware_interface
                                       "ADS Sum Read size mismatch. Expected %zu, Got %u.",
                                       ads_buffer_sum_read_response_.size(), bytes_read_from_plc);
                 record_read_failure();
-                read_comms_ok_.store(false, std::memory_order_release);
                 std::this_thread::sleep_for(ERROR_BACKOFF);
                 continue;
             }
 
-            // Declare recovery only after the link has been good for a stable period, so a
-            // flapping link logs one outage instead of an error/recovery pair per cycle.
-            if (read_consecutive_failures_ > 0)
-            {
-                const std::chrono::steady_clock::time_point now_steady = std::chrono::steady_clock::now();
-                if (!read_recovery_stable_since_)
-                {
-                    read_recovery_stable_since_ = now_steady;
-                }
-                else if (now_steady - *read_recovery_stable_since_ >= RECOVERY_STABLE_PERIOD)
-                {
-                    const int64_t outage_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                  *read_recovery_stable_since_ - read_outage_start_)
-                                                  .count();
-                    RCLCPP_INFO(getLogger(),
-                                "ADS Sum Read recovered after %zu failed cycles (%.1f s).",
-                                read_consecutive_failures_, static_cast<double>(outage_ms) / 1000.0);
-                    read_consecutive_failures_ = 0;
-                    read_recovery_stable_since_.reset();
-                }
-            }
-
-            bool any_item_read_failed = false;
+            // Per-item errors hold that item's last value; only every item failing is a link failure.
+            size_t items_failed = 0;
             for (size_t i = 0; i < ads_read_instructions_.size(); ++i)
             {
                 const auto &read_instruction = ads_read_instructions_[i];
@@ -848,7 +875,7 @@ namespace beckhoff_ads_hardware_interface
                                          "ADS Sum Read operation corresponding to the state interface '%s' failed: 0x%X (%s).",
                                          read_instruction.state_interface_name.c_str(), item_error_code,
                                          adsErrorText(static_cast<long>(item_error_code)));
-                    any_item_read_failed = true;
+                    ++items_failed;
                     continue;
                 }
 
@@ -856,7 +883,35 @@ namespace beckhoff_ads_hardware_interface
                 polling_read_cache_[i].store(decode_plc_element(read_instruction.plc_type, ptr_plc_element_current),
                                              std::memory_order_release);
             }
-            read_comms_ok_.store(!any_item_read_failed, std::memory_order_release);
+
+            if (items_failed == ads_read_instructions_.size() && !ads_read_instructions_.empty())
+            {
+                record_read_failure();
+            }
+            else
+            {
+                read_hard_fault_.store(false, std::memory_order_release);
+                // Declare recovery only after a stable period, so a flapping link logs once.
+                if (read_consecutive_failures_ > 0)
+                {
+                    const std::chrono::steady_clock::time_point now_steady = std::chrono::steady_clock::now();
+                    if (!read_recovery_stable_since_)
+                    {
+                        read_recovery_stable_since_ = now_steady;
+                    }
+                    else if (now_steady - *read_recovery_stable_since_ >= RECOVERY_STABLE_PERIOD)
+                    {
+                        const int64_t outage_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                      *read_recovery_stable_since_ - read_outage_start_)
+                                                      .count();
+                        RCLCPP_INFO(getLogger(),
+                                    "ADS Sum Read recovered after %zu failed cycles (%.1f s).",
+                                    read_consecutive_failures_, static_cast<double>(outage_ms) / 1000.0);
+                        read_consecutive_failures_ = 0;
+                        read_recovery_stable_since_.reset();
+                    }
+                }
+            }
 
             // Optional pacing to cap PLC load; period 0 = unpaced.
             if (read_poll_period_ns_ > 0)
@@ -875,7 +930,10 @@ namespace beckhoff_ads_hardware_interface
             return hardware_interface::return_type::OK;
         }
 
-        for (const auto &write_instruction : ads_write_instructions_)
+        uint64_t fallbacks_this_cycle = 0;
+        uint64_t never_commanded_this_cycle = 0;
+
+        for (auto &write_instruction : ads_write_instructions_)
         {
             uint8_t *ptr_write_buffer_destination_current = ads_buffer_sum_write_request_.data() + write_instruction.write_buffer_offset_data;
 
@@ -892,9 +950,26 @@ namespace beckhoff_ads_hardware_interface
             double val = get_command(write_instruction.command_interface_name);
             set_command(write_instruction.command_interface_name, std::numeric_limits<double>::quiet_NaN());
 
+            if (!std::isnan(val))
+            {
+                write_instruction.has_been_commanded = true;
+            }
+
             if (std::isnan(val))
             {
-                fallback_activations_.fetch_add(1, std::memory_order_relaxed);
+                if (write_instruction.has_been_commanded)
+                {
+                    ++fallbacks_this_cycle;
+                    fallback_activations_.fetch_add(1, std::memory_order_relaxed);
+                    RCLCPP_WARN_THROTTLE(getLogger(), *logging_throttle_clock_, 5000,
+                                         "Command interface '%s' carried no command this cycle after having been "
+                                         "commanded before. Applying its fallback.",
+                                         write_instruction.command_interface_name.c_str());
+                }
+                else
+                {
+                    ++never_commanded_this_cycle;
+                }
 
                 if (write_instruction.fallback == CommandFallback::ZERO)
                 {
@@ -991,6 +1066,9 @@ namespace beckhoff_ads_hardware_interface
             }
         }
 
+        fallback_activations_cycle_.store(fallbacks_this_cycle, std::memory_order_relaxed);
+        never_commanded_interfaces_.store(never_commanded_this_cycle, std::memory_order_relaxed);
+
         refresh_transaction_statistics();
 
         // Hand the freshly packed request to the writer thread and return immediately. A newer
@@ -1007,9 +1085,9 @@ namespace beckhoff_ads_hardware_interface
         }
         write_cv_.notify_one();
 
-        return write_comms_ok_.load(std::memory_order_acquire)
-                   ? hardware_interface::return_type::OK
-                   : hardware_interface::return_type::ERROR;
+        return write_hard_fault_.load(std::memory_order_acquire)
+                   ? hardware_interface::return_type::ERROR
+                   : hardware_interface::return_type::OK;
     }
 
     void BeckhoffADSHardwareInterface::writer_loop()
@@ -1071,7 +1149,6 @@ namespace beckhoff_ads_hardware_interface
                                           ads_sum_write_error, adsErrorText(ads_sum_write_error));
                 }
                 record_write_failure();
-                write_comms_ok_.store(false, std::memory_order_release);
                 continue;
             }
 
@@ -1081,34 +1158,12 @@ namespace beckhoff_ads_hardware_interface
                                       "ADS Sum Write response size mismatch (error codes). Expected %zu, Got %u.",
                                       ads_buffer_sum_write_response_.size(), bytes_response_buffer_from_plc);
                 record_write_failure();
-                write_comms_ok_.store(false, std::memory_order_release);
                 continue;
             }
 
-            // Declare recovery only after the link has been good for a stable period, so a
-            // flapping link logs one outage instead of an error/recovery pair per round-trip.
-            if (write_consecutive_failures_ > 0)
-            {
-                const std::chrono::steady_clock::time_point now_steady = std::chrono::steady_clock::now();
-                if (!write_recovery_stable_since_)
-                {
-                    write_recovery_stable_since_ = now_steady;
-                }
-                else if (now_steady - *write_recovery_stable_since_ >= RECOVERY_STABLE_PERIOD)
-                {
-                    const int64_t outage_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                  *write_recovery_stable_since_ - write_outage_start_)
-                                                  .count();
-                    RCLCPP_INFO(getLogger(),
-                                "ADS Sum Write recovered after %zu failed round-trips (%.1f s).",
-                                write_consecutive_failures_, static_cast<double>(outage_ms) / 1000.0);
-                    write_consecutive_failures_ = 0;
-                    write_recovery_stable_since_.reset();
-                }
-            }
-
             // One error code per write item, in request order: index i maps to layout i.
-            bool any_item_write_failed = false;
+            // Only every item failing counts as a link failure.
+            size_t items_failed = 0;
             for (size_t i = 0; i < num_items_write_; ++i)
             {
                 uint32_t item_error_code;
@@ -1119,18 +1174,46 @@ namespace beckhoff_ads_hardware_interface
                                          "ADS Sum Write sub-op for '%s' (handle 0x%X) failed: 0x%X (%s)",
                                          ads_item_layouts_write_[i].plc_name_symbolic.c_str(), ads_item_layouts_write_[i].ads_handle, item_error_code,
                                          adsErrorText(static_cast<long>(item_error_code)));
-                    any_item_write_failed = true;
+                    ++items_failed;
                 }
             }
-            write_comms_ok_.store(!any_item_write_failed, std::memory_order_release);
+
+            if (items_failed == num_items_write_ && num_items_write_ > 0)
+            {
+                record_write_failure();
+            }
+            else
+            {
+                write_hard_fault_.store(false, std::memory_order_release);
+                // Declare recovery only after a stable period, so a flapping link logs once.
+                if (write_consecutive_failures_ > 0)
+                {
+                    const std::chrono::steady_clock::time_point now_steady = std::chrono::steady_clock::now();
+                    if (!write_recovery_stable_since_)
+                    {
+                        write_recovery_stable_since_ = now_steady;
+                    }
+                    else if (now_steady - *write_recovery_stable_since_ >= RECOVERY_STABLE_PERIOD)
+                    {
+                        const int64_t outage_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                      *write_recovery_stable_since_ - write_outage_start_)
+                                                      .count();
+                        RCLCPP_INFO(getLogger(),
+                                    "ADS Sum Write recovered after %zu failed round-trips (%.1f s).",
+                                    write_consecutive_failures_, static_cast<double>(outage_ms) / 1000.0);
+                        write_consecutive_failures_ = 0;
+                        write_recovery_stable_since_.reset();
+                    }
+                }
+            }
         }
     }
 
     void BeckhoffADSHardwareInterface::start_io_threads()
     {
         // Clear any stale fault before (re)starting.
-        write_comms_ok_.store(true, std::memory_order_release);
-        read_comms_ok_.store(true, std::memory_order_release);
+        write_hard_fault_.store(false, std::memory_order_release);
+        read_hard_fault_.store(false, std::memory_order_release);
         read_consecutive_failures_ = 0;
         write_consecutive_failures_ = 0;
         read_recovery_stable_since_.reset();
@@ -1175,6 +1258,20 @@ namespace beckhoff_ads_hardware_interface
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_shutdown(
         const rclcpp_lifecycle::State & /*previous_state*/)
     {
+        teardown_ads_device();
+        return hardware_interface::CallbackReturn::SUCCESS;
+    }
+
+    hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_error(
+        const rclcpp_lifecycle::State & /*previous_state*/)
+    {
+        RCLCPP_ERROR(getLogger(), "ADS component entering the error state. Dropping the link.");
+        teardown_ads_device();
+        return hardware_interface::CallbackReturn::SUCCESS;
+    }
+
+    void BeckhoffADSHardwareInterface::teardown_ads_device()
+    {
         RCLCPP_INFO(getLogger(), "Releasing ADS resources...");
         // Stop the worker threads before touching the device; both call through ads_device_.
         // Safe to call even if on_deactivate already joined them.
@@ -1182,13 +1279,8 @@ namespace beckhoff_ads_hardware_interface
         // Release symbol handles before the device: their deleters call DeleteSymbolHandle
         // through ads_device_. Skipping this is what segfaulted on Ctrl-C.
         release_ads_handles();
-        if (ads_device_)
-        {
-            ads_device_.reset();
-        }
+        ads_device_.reset();
         RCLCPP_INFO(getLogger(), "ADS resources released.");
-
-        return hardware_interface::CallbackReturn::SUCCESS;
     }
 
     void BeckhoffADSHardwareInterface::release_ads_handles()
@@ -1214,7 +1306,14 @@ namespace beckhoff_ads_hardware_interface
             std::string plc_ip = params.at("plc_ip_address");
             std::string plc_ams_net_id_str = params.at("plc_ams_net_id");
             std::string local_ams_net_id_str = params.at("local_ams_net_id");
-            uint16_t plc_ams_port = std::stoul(params.at("plc_ams_port"));
+            const utilities::AmsPortParseResult port_parse = utilities::parseAmsPort(params.at("plc_ams_port"));
+            if (!port_parse.valid)
+            {
+                RCLCPP_FATAL(getLogger(), "\tInvalid 'plc_ams_port' '%s': %s.",
+                             params.at("plc_ams_port").c_str(), port_parse.error.c_str());
+                return false;
+            }
+            uint16_t plc_ams_port = port_parse.port;
             plc_ip_address_ = plc_ip;
             plc_ams_net_id_str_ = plc_ams_net_id_str;
             plc_ams_port_ = plc_ams_port;
@@ -1272,8 +1371,7 @@ namespace beckhoff_ads_hardware_interface
 
     PLCType BeckhoffADSHardwareInterface::strToPlcType(const std::string &type_str_param)
     {
-        std::string type_str = type_str_param;
-        std::transform(type_str.begin(), type_str.end(), type_str.begin(), ::toupper);
+        std::string type_str = utilities::toUpperCopy(type_str_param);
 
         if (type_str == "LREAL")
             return PLCType::LREAL;
