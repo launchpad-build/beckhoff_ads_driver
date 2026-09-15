@@ -33,6 +33,8 @@
 
 #include "ads/AdsLib.h"
 #include "ads/AdsDevice.h"
+
+#include "beckhoff_ads_hardware_interface/ads_interface_utilities.hpp"
 namespace beckhoff_ads_hardware_interface
 {
 
@@ -118,6 +120,17 @@ namespace beckhoff_ads_hardware_interface
     CommandFallback fallback = CommandFallback::HOLD_LAST;
     bool is_heartbeat = false; // value comes from the interface's own counter, not a controller
     bool has_been_commanded = false;
+    // An unseeded field keeps its whole item out of the transmitted request.
+    bool seeded = false;
+    size_t layout_index = 0; // index of the owning layout in ads_item_layouts_write_
+  };
+
+  // The latest packed sum-write request handed from write() to the writer thread.
+  struct PendingWrite
+  {
+    std::vector<uint8_t> buffer;
+    std::vector<size_t> layout_indices; // original layout index of each item in the buffer
+    size_t num_items = 0;
   };
 
   class BeckhoffADSHardwareInterface : public hardware_interface::SystemInterface
@@ -171,6 +184,21 @@ namespace beckhoff_ads_hardware_interface
     CommandFallback parseCommandFallback(const std::string &policy_str, const std::string &interface_name);
 
     /**
+     * @brief Tells whether a state interface declared an initial_value in its description
+     *
+     * @param interface_name The full state interface name
+     * @returns True when the URDF declared a non-empty initial_value for it
+     */
+    bool stateInterfaceHasDeclaredInitialValue(const std::string &interface_name) const;
+
+    /**
+     * @brief Pins the state interfaces of dropped optional symbols to a defined value
+     *
+     * @param dropped_interfaces State interface names whose PLC symbol was dropped
+     */
+    void settle_dropped_state_interfaces(const std::vector<std::string> &dropped_interfaces);
+
+    /**
      * @brief Records a failed SUM-read round-trip for outage and recovery logs
      *
      * Stamps the outage start on the first failure and resets recovery tracking.
@@ -211,14 +239,16 @@ namespace beckhoff_ads_hardware_interface
 
     // ADS Communication objects
     // Reset or replace only after stop_io_threads() has joined both I/O threads.
-    std::unique_ptr<AdsDevice> ads_device_; // Manages the route/connection to the PLC
+    // Two local AMS ports on one net id, so the reader and writer never contend for a port.
+    std::unique_ptr<AdsDevice> ads_read_device_;  // owned by the reader thread's round-trips
+    std::unique_ptr<AdsDevice> ads_write_device_; // owned by the writer thread's round-trips
     bool configure_ads_device();
 
-    // Joins the I/O threads, releases the handles and drops the device, in that order.
+    // Joins the I/O threads, releases the handles and drops the devices, in that order.
     void teardown_ads_device();
 
     // Releases every cached PLC symbol handle (ADSDataLayout::ads_handle_owner). Each handle's
-    // deleter calls DeleteSymbolHandle through ads_device_, so this MUST run while ads_device_
+    // deleter calls DeleteSymbolHandle through the issuing device, so this must run while it
     // is still alive, i.e. before resetting/replacing it. Otherwise the deleters dereference a
     // freed device and segfault (seen on Ctrl-C teardown).
     void release_ads_handles();
@@ -244,6 +274,13 @@ namespace beckhoff_ads_hardware_interface
     std::vector<uint8_t> ads_buffer_sum_write_request_;
     std::vector<uint8_t> ads_buffer_sum_write_response_;
     size_t num_items_write_ = 0;
+
+    // Owned by the control loop; the writer thread only sees the handed-over PendingWrite.
+    std::vector<utilities::SumWriteItemSpan> write_item_spans_;
+    std::vector<size_t> identity_layout_indices_;
+    std::vector<uint8_t> write_layout_seeded_;
+    std::vector<uint8_t> ads_buffer_sum_write_compact_;
+    std::vector<size_t> compact_layout_indices_;
 
     /**
      * @brief Copies the I/O threads' counters into the introspected mirrors
@@ -295,20 +332,13 @@ namespace beckhoff_ads_hardware_interface
     void start_io_threads(); // spawns the writer and reader threads
     void stop_io_threads();  // signals and joins both worker threads; safe to call when idle
 
-    // Serialises the reader's and writer's ADS round-trips. ads_device_ owns a single local AMS
-    // port, and the underlying library allows only one in-flight request per port. Without this
-    // the writer's port reservation collides with the reader's in-flight read and fails. Held
-    // only around each ReadWriteReqEx2 call, never the control loop, so read()/write() stay
-    // non-blocking.
-    std::mutex ads_io_mutex_;
-
     // Writer thread: owns the SUM-write round-trip. write() marshals the latest command
     // buffer, hands it over here, and returns. Only the newest buffer is sent (coalescing).
     void writer_loop();
     std::thread write_thread_;
     std::mutex write_mutex_;
     std::condition_variable write_cv_;
-    std::vector<uint8_t> write_pending_request_; // latest packed SUM-write request awaiting send
+    PendingWrite write_pending_request_; // latest packed SUM-write request awaiting send
     bool write_pending_ = false;                 // a fresh buffer is waiting (guarded by write_mutex_)
     bool write_stop_ = false;                     // stop request (guarded by write_mutex_)
     std::atomic<bool> write_hard_fault_{false};   // outage outlived the grace window, surfaced by write()
