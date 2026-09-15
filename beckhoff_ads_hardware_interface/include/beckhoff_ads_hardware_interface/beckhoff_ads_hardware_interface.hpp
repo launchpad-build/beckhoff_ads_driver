@@ -61,6 +61,14 @@ namespace beckhoff_ads_hardware_interface
     ZERO,         // send zero; the right answer for a velocity or effort command
   };
 
+  enum class WriteValueSource
+  {
+    CONTROLLER,         // a ros2_control command interface
+    HEARTBEAT,          // the interface's own link-liveness counter
+    SETPOINT_SEQUENCE,  // the per-write-cycle setpoint sequence number
+    SETPOINT_TIMESTAMP, // the steady-clock instant the packed setpoints describe
+  };
+
   // Describes each PLC item (array or single variable) for polling via sum commands.
   struct ADSDataLayout
   {
@@ -123,12 +131,12 @@ namespace beckhoff_ads_hardware_interface
     std::string command_interface_name;
     std::string fallback_state_interface_name; // The state interface name corresponding to the current command interface name
     CommandFallback fallback = CommandFallback::HOLD_LAST;
-    bool is_heartbeat = false; // value comes from the interface's own counter, not a controller
+    WriteValueSource source = WriteValueSource::CONTROLLER;
     bool has_been_commanded = false;
     // An unseeded field keeps its whole item out of the transmitted request.
     bool seeded = false;
     size_t layout_index = 0; // index of the owning layout in ads_item_layouts_write_
-    // Resolved once at configure so write() stays non-blocking. Null for the heartbeat.
+    // Resolved once at configure so write() stays non-blocking. Null for the synthetic sources.
     hardware_interface::CommandInterface::SharedPtr command_handle;
     hardware_interface::StateInterface::SharedPtr fallback_state_handle;
   };
@@ -234,8 +242,35 @@ namespace beckhoff_ads_hardware_interface
     // Synthetic heartbeat name, never exported to ros2_control.
     static constexpr const char *HEARTBEAT_INTERFACE_NAME = "__ads_link_heartbeat";
 
+    // Synthetic names, never exported to ros2_control.
+    static constexpr const char *SETPOINT_SEQUENCE_INTERFACE_NAME = "__ads_setpoint_sequence";
+    static constexpr const char *SETPOINT_TIMESTAMP_INTERFACE_NAME = "__ads_setpoint_timestamp";
+
+    /**
+     * @brief Classifies which source provides a write instruction's value
+     *
+     * @param interface_name The command interface name, real or synthetic
+     * @returns The source the packing loop draws the value from
+     */
+    static WriteValueSource classifyWriteValueSource(const std::string &interface_name);
+
+    /**
+     * @brief Appends a synthetic single-element write layout for an interface-owned symbol
+     *
+     * @param plc_symbol The PLC symbol the layout targets
+     * @param plc_type The PLC type of the symbol
+     * @param interface_name The synthetic interface name tagging the instruction
+     */
+    void append_synthetic_write_layout(
+        const std::string &plc_symbol, PLCType plc_type, const char *interface_name);
+
     std::string heartbeat_symbol_;        // PLC symbol to beat on; empty disables the heartbeat
     uint32_t heartbeat_counter_{0};       // advanced in write(), so control-loop thread only
+
+    std::string setpoint_sequence_symbol_;  // PLC symbol for the sequence; empty disables it
+    std::string setpoint_timestamp_symbol_; // PLC symbol for the timestamp; empty disables it
+    // Advanced once per write() cycle, so control-loop thread only.
+    utilities::SetpointSequenceCounter setpoint_sequence_counter_;
 
     // Connection target details kept for error logs (populated in configure_ads_device).
     std::string plc_ip_address_;
@@ -279,6 +314,20 @@ namespace beckhoff_ads_hardware_interface
     // is still alive, i.e. before resetting/replacing it. Otherwise the deleters dereference a
     // freed device and segfault (seen on Ctrl-C teardown).
     void release_ads_handles();
+
+    /**
+     * @brief Warns when a joint position or velocity interface is declared as 32-bit REAL
+     *
+     * @param interface_name The full interface name, for the warning
+     * @param description The interface description holding the short interface name
+     * @param is_joint True when the interface belongs to a joint
+     * @param plc_type_str The declared PLC_type parameter text
+     */
+    void warn_if_joint_motion_interface_is_32_bit(
+        const std::string &interface_name,
+        const hardware_interface::InterfaceDescription &description,
+        bool is_joint,
+        const std::string &plc_type_str);
 
     // Metadata (populated in on interface export)
     // Describes each variable on the PLC
@@ -351,6 +400,7 @@ namespace beckhoff_ads_hardware_interface
     double stat_fallback_activations_per_cycle_{0.0};
     double stat_never_commanded_interfaces_{0.0};
     double stat_heartbeat_{0.0};
+    double stat_setpoint_sequence_{0.0};
     double stat_read_sample_age_ms_{0.0}; // age of the sample read() last published; control loop only
 
     std::vector<ReadInstruction> ads_read_instructions_;

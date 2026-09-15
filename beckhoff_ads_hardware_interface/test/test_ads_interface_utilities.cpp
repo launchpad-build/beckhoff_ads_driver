@@ -6,6 +6,9 @@
 // Unauthorized copying of this file, via any medium is strictly prohibited.
 // The file is considered confidential.
 
+#include <chrono>
+#include <limits>
+
 #include <gtest/gtest.h>
 
 #include "beckhoff_ads_hardware_interface/ads_interface_utilities.hpp"
@@ -131,6 +134,35 @@ TEST(CompactSumWriteRequest, NoItemsIncludedYieldsAnEmptyRequest)
   utilities::compactSumWriteRequest(makeFullRequest(), makeSpans(), {0, 0, 0}, compact, indices);
   EXPECT_TRUE(compact.empty());
   EXPECT_TRUE(indices.empty());
+}
+
+TEST(SetpointSequenceCounter, AdvancesByOnePerCall)
+{
+  utilities::SetpointSequenceCounter counter;
+  EXPECT_EQ(counter.next(), 1u);
+  EXPECT_EQ(counter.next(), 2u);
+  EXPECT_EQ(counter.current(), 2u);
+}
+
+TEST(SetpointSequenceCounter, WrapsAtTheThirtyTwoBitBoundary)
+{
+  utilities::SetpointSequenceCounter counter(std::numeric_limits<uint32_t>::max() - 1u);
+  EXPECT_EQ(counter.next(), std::numeric_limits<uint32_t>::max());
+  EXPECT_EQ(counter.next(), 0u);
+  EXPECT_EQ(counter.next(), 1u);
+}
+
+TEST(MonotonicSeconds, ConvertsAKnownInstantToSeconds)
+{
+  const std::chrono::steady_clock::time_point instant(std::chrono::milliseconds(1500));
+  EXPECT_DOUBLE_EQ(utilities::monotonicSeconds(instant), 1.5);
+}
+
+TEST(MonotonicSeconds, NeverDecreasesAcrossConsecutiveClockReads)
+{
+  const double first = utilities::monotonicSeconds(std::chrono::steady_clock::now());
+  const double second = utilities::monotonicSeconds(std::chrono::steady_clock::now());
+  EXPECT_GE(second, first);
 }
 
 TEST(ToUpperCopy, ToleratesBytesOutsideTheAsciiRange)

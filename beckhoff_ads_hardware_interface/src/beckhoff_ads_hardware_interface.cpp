@@ -315,6 +315,23 @@ namespace beckhoff_ads_hardware_interface
             RCLCPP_INFO(getLogger(), "ADS link heartbeat enabled on PLC symbol '%s'.", heartbeat_symbol_.c_str());
         }
 
+        setpoint_sequence_symbol_.clear();
+        const auto sequence_it = info_.hardware_parameters.find("setpoint_sequence_plc_symbol");
+        if (sequence_it != info_.hardware_parameters.end() && !sequence_it->second.empty())
+        {
+            setpoint_sequence_symbol_ = sequence_it->second;
+            RCLCPP_INFO(getLogger(), "Setpoint sequence enabled on PLC symbol '%s'.",
+                        setpoint_sequence_symbol_.c_str());
+        }
+        setpoint_timestamp_symbol_.clear();
+        const auto stamp_it = info_.hardware_parameters.find("setpoint_time_plc_symbol");
+        if (stamp_it != info_.hardware_parameters.end() && !stamp_it->second.empty())
+        {
+            setpoint_timestamp_symbol_ = stamp_it->second;
+            RCLCPP_INFO(getLogger(), "Setpoint timestamp enabled on PLC symbol '%s'.",
+                        setpoint_timestamp_symbol_.c_str());
+        }
+
         // Configure ADS Client Device
         if (!configure_ads_device())
         {
@@ -594,9 +611,9 @@ namespace beckhoff_ads_hardware_interface
                     write_instruction.plc_type = layout.plc_type;
                     write_instruction.command_interface_name = interface_name;
                     write_instruction.fallback_state_interface_name = "";
-                    write_instruction.is_heartbeat = (interface_name == HEARTBEAT_INTERFACE_NAME);
+                    write_instruction.source = classifyWriteValueSource(interface_name);
                     write_instruction.layout_index = i;
-                    if (!write_instruction.is_heartbeat)
+                    if (write_instruction.source == WriteValueSource::CONTROLLER)
                     {
                         write_instruction.command_handle = get_command_interface_handle(interface_name);
                     }
@@ -624,7 +641,7 @@ namespace beckhoff_ads_hardware_interface
                         }
                     }
 
-                    if (write_instruction.is_heartbeat)
+                    if (write_instruction.source != WriteValueSource::CONTROLLER)
                     {
                         write_instruction.seeded = true;
                     }
@@ -656,6 +673,24 @@ namespace beckhoff_ads_hardware_interface
         }
 
         return true;
+    }
+
+    void BeckhoffADSHardwareInterface::warn_if_joint_motion_interface_is_32_bit(
+        const std::string &interface_name,
+        const hardware_interface::InterfaceDescription &description,
+        bool is_joint,
+        const std::string &plc_type_str)
+    {
+        const bool motion_interface =
+            is_joint && (description.interface_info.name == hardware_interface::HW_IF_POSITION ||
+                         description.interface_info.name == hardware_interface::HW_IF_VELOCITY);
+        if (motion_interface && utilities::toUpperCopy(plc_type_str) == "REAL")
+        {
+            RCLCPP_WARN(getLogger(),
+                        "Joint interface '%s' is declared as 32-bit REAL. A position or velocity "
+                        "stream loses precision through a float; declare it LREAL on the PLC and here.",
+                        interface_name.c_str());
+        }
     }
 
     void BeckhoffADSHardwareInterface::ads_read_layout_configure()
@@ -709,6 +744,8 @@ namespace beckhoff_ads_hardware_interface
                 {
                     interface_critical = descr.interface_info.parameters.at("critical") == "true";
                 }
+
+                warn_if_joint_motion_interface_is_32_bit(name, descr, is_joint, plc_type_str);
 
                 // If this is the first time we see this symbol, create the layout
                 if (processed_plc_symbols.find(plc_symbol) == processed_plc_symbols.end())
@@ -799,6 +836,8 @@ namespace beckhoff_ads_hardware_interface
                 {
                     fallback_str = descr.interface_info.parameters.at("command_fallback");
                 }
+                warn_if_joint_motion_interface_is_32_bit(name, descr, is_joint, plc_type_str);
+
                 CommandFallback fallback_policy;
                 if (fallback_str.empty() && is_joint &&
                     descr.interface_info.name == hardware_interface::HW_IF_VELOCITY)
@@ -859,14 +898,30 @@ namespace beckhoff_ads_hardware_interface
 
         if (!heartbeat_symbol_.empty())
         {
-            ADSDataLayout layout;
-            layout.plc_name_symbolic = heartbeat_symbol_;
-            layout.num_elements = 1;
-            layout.plc_type = PLCType::UDINT;
-            layout.plc_element_byte_size = plcTypeByteSize(PLCType::UDINT);
-            layout.ros2_interfaces_.emplace(0, HEARTBEAT_INTERFACE_NAME);
-            ads_item_layouts_write_.push_back(std::move(layout));
+            append_synthetic_write_layout(heartbeat_symbol_, PLCType::UDINT, HEARTBEAT_INTERFACE_NAME);
         }
+        if (!setpoint_sequence_symbol_.empty())
+        {
+            append_synthetic_write_layout(setpoint_sequence_symbol_, PLCType::UDINT,
+                                          SETPOINT_SEQUENCE_INTERFACE_NAME);
+        }
+        if (!setpoint_timestamp_symbol_.empty())
+        {
+            append_synthetic_write_layout(setpoint_timestamp_symbol_, PLCType::LREAL,
+                                          SETPOINT_TIMESTAMP_INTERFACE_NAME);
+        }
+    }
+
+    void BeckhoffADSHardwareInterface::append_synthetic_write_layout(
+        const std::string &plc_symbol, PLCType plc_type, const char *interface_name)
+    {
+        ADSDataLayout layout;
+        layout.plc_name_symbolic = plc_symbol;
+        layout.num_elements = 1;
+        layout.plc_type = plc_type;
+        layout.plc_element_byte_size = plcTypeByteSize(plc_type);
+        layout.ros2_interfaces_.emplace(0, interface_name);
+        ads_item_layouts_write_.push_back(std::move(layout));
     }
 
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_activate(
@@ -995,6 +1050,24 @@ namespace beckhoff_ads_hardware_interface
         return text;
     }
 
+    WriteValueSource BeckhoffADSHardwareInterface::classifyWriteValueSource(const std::string &interface_name)
+    {
+        WriteValueSource result = WriteValueSource::CONTROLLER;
+        if (interface_name == HEARTBEAT_INTERFACE_NAME)
+        {
+            result = WriteValueSource::HEARTBEAT;
+        }
+        else if (interface_name == SETPOINT_SEQUENCE_INTERFACE_NAME)
+        {
+            result = WriteValueSource::SETPOINT_SEQUENCE;
+        }
+        else if (interface_name == SETPOINT_TIMESTAMP_INTERFACE_NAME)
+        {
+            result = WriteValueSource::SETPOINT_TIMESTAMP;
+        }
+        return result;
+    }
+
     CommandFallback BeckhoffADSHardwareInterface::parseCommandFallback(
         const std::string &policy_str, const std::string &interface_name)
     {
@@ -1038,6 +1111,7 @@ namespace beckhoff_ads_hardware_interface
         stat_never_commanded_interfaces_ =
             static_cast<double>(never_commanded_interfaces_.load(std::memory_order_relaxed));
         stat_heartbeat_ = static_cast<double>(heartbeat_counter_);
+        stat_setpoint_sequence_ = static_cast<double>(setpoint_sequence_counter_.current());
     }
 
     void BeckhoffADSHardwareInterface::register_transaction_statistics()
@@ -1055,6 +1129,7 @@ namespace beckhoff_ads_hardware_interface
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_fallback_activations_per_cycle", &stat_fallback_activations_per_cycle_);
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_never_commanded_interfaces", &stat_never_commanded_interfaces_);
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_heartbeat", &stat_heartbeat_);
+        REGISTER_ROS2_CONTROL_INTROSPECTION("ads_setpoint_sequence", &stat_setpoint_sequence_);
         REGISTER_ROS2_CONTROL_INTROSPECTION("ads_read_sample_age_ms", &stat_read_sample_age_ms_);
     }
 
@@ -1245,6 +1320,9 @@ namespace beckhoff_ads_hardware_interface
             return hardware_interface::return_type::OK;
         }
 
+        const uint32_t setpoint_sequence = setpoint_sequence_counter_.next();
+        const double setpoint_stamp_seconds = utilities::monotonicSeconds(std::chrono::steady_clock::now());
+
         uint64_t fallbacks_this_cycle = 0;
         uint64_t never_commanded_this_cycle = 0;
         const char *first_fallback_interface = nullptr;
@@ -1255,10 +1333,22 @@ namespace beckhoff_ads_hardware_interface
         {
             uint8_t *ptr_write_buffer_destination_current = ads_buffer_sum_write_request_.data() + write_instruction.write_buffer_offset_data;
 
-            if (write_instruction.is_heartbeat)
+            if (write_instruction.source == WriteValueSource::HEARTBEAT)
             {
                 const uint32_t beat = ++heartbeat_counter_;
                 memcpy(ptr_write_buffer_destination_current, &beat, sizeof(beat));
+                continue;
+            }
+
+            if (write_instruction.source == WriteValueSource::SETPOINT_SEQUENCE)
+            {
+                memcpy(ptr_write_buffer_destination_current, &setpoint_sequence, sizeof(setpoint_sequence));
+                continue;
+            }
+
+            if (write_instruction.source == WriteValueSource::SETPOINT_TIMESTAMP)
+            {
+                memcpy(ptr_write_buffer_destination_current, &setpoint_stamp_seconds, sizeof(setpoint_stamp_seconds));
                 continue;
             }
 
