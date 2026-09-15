@@ -53,7 +53,6 @@ namespace beckhoff_ads_hardware_interface
     STRING,
   };
 
-  // What to send for a command interface on a cycle where no controller wrote one.
   enum class CommandFallback
   {
     HOLD_LAST,    // keep whatever was packed on the last cycle that carried a command
@@ -87,11 +86,9 @@ namespace beckhoff_ads_hardware_interface
     // For interfaces targeting the same PLC symbol, store all their names with their corresponding index inside a map. This will be useful when calling thr ROS2 set_state and set_command functions.
     std::map<size_t, std::string> ros2_interfaces_;
 
-    // Per-interface command_fallback, parsed from the interface parameters.
     std::map<std::string, CommandFallback> fallback_policies_;
 
-    // True when every interface on this symbol declared optional="true". An optional symbol
-    // the PLC does not have is dropped with a warning; a required one fails configure.
+    // True only when every interface on this symbol declared optional="true".
     bool optional = false;
     bool handle_resolved = false;
   };
@@ -184,8 +181,7 @@ namespace beckhoff_ads_hardware_interface
      */
     void record_write_failure();
 
-    // Synthetic interface name for the link heartbeat. Never exported to ros2_control; it
-    // only tags the write instruction whose value the interface generates itself.
+    // Synthetic heartbeat name, never exported to ros2_control.
     static constexpr const char *HEARTBEAT_INTERFACE_NAME = "__ads_link_heartbeat";
 
     std::string heartbeat_symbol_;        // PLC symbol to beat on; empty disables the heartbeat
@@ -239,10 +235,6 @@ namespace beckhoff_ads_hardware_interface
 
     /**
      * @brief Copies the I/O threads' counters into the introspected mirrors
-     *
-     * pal_statistics reads plain doubles by address from the publisher thread, so the
-     * atomics the I/O threads own are mirrored here, on the control loop, rather than
-     * registered directly.
      */
     void refresh_transaction_statistics();
 
@@ -252,9 +244,6 @@ namespace beckhoff_ads_hardware_interface
     void register_transaction_statistics();
 
     // ===== ADS transaction statistics ==========================================
-    // Written by the I/O threads, mirrored onto the control loop and published through
-    // the controller manager's introspection topic, so a bag holds the link's behaviour
-    // alongside the trajectory it was carrying.
     std::atomic<long long> read_rtt_ns_{0};
     std::atomic<long long> write_rtt_ns_{0};
     std::atomic<uint64_t> read_transactions_total_{0};
@@ -262,8 +251,6 @@ namespace beckhoff_ads_hardware_interface
     std::atomic<uint64_t> write_coalesced_total_{0};
     std::atomic<uint64_t> read_failures_total_{0};
     std::atomic<uint64_t> write_failures_total_{0};
-
-    // Cycles on which a command interface carried no command and its fallback applied.
     std::atomic<uint64_t> fallback_activations_{0};
 
     // Introspected mirrors. Only the control loop writes these.

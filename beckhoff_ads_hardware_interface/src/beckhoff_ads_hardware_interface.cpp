@@ -138,9 +138,6 @@ namespace beckhoff_ads_hardware_interface
             RCLCPP_WARN(getLogger(), "Invalid read_poll_period_ms: %s. Running unpaced.", ex.what());
         }
 
-        // Optional link heartbeat. The PLC watches this counter for movement, so it can tell
-        // a live control stack from one that died mid-move. Absent = disabled, which is what
-        // every stack that has not asked for it gets.
         heartbeat_symbol_.clear();
         auto heartbeat_it = info_.hardware_parameters.find("heartbeat_plc_symbol");
         if (heartbeat_it != info_.hardware_parameters.end() && !heartbeat_it->second.empty())
@@ -161,13 +158,6 @@ namespace beckhoff_ads_hardware_interface
         ads_write_layout_configure();
 
         // Request handles for all symbolic PLC variable names
-        // An unresolved handle used to be logged and then left in the sum buffers with a zero
-        // handle, so every round trip came back with a per-item error, read() faulted the
-        // component on the first cycle and the controller manager tore the whole stack down.
-        // One symbol the PLC had not been flashed with yet took the machine out. Drop the
-        // unresolved ones from the buffers instead, and only tolerate the ones declared
-        // optional; a required symbol that is missing fails configure, which is honest and
-        // happens before anything is running.
         RCLCPP_INFO(getLogger(), "Fetching ADS handles for configured PLC variables...");
         bool required_symbol_missing = false;
 
@@ -200,8 +190,7 @@ namespace beckhoff_ads_hardware_interface
                 }
             }
 
-            // Rebuild rather than erase-remove: ADSDataLayout owns an AdsHandle and so is
-            // move-constructible but not move-assignable, which remove_if needs.
+            // ADSDataLayout is not move-assignable, so no erase-remove here.
             std::vector<ADSDataLayout> resolved;
             resolved.reserve(layouts.size());
             for (auto &layout : layouts)
@@ -223,10 +212,7 @@ namespace beckhoff_ads_hardware_interface
         }
         RCLCPP_INFO(getLogger(), "\tHandles acquired");
 
-        // Link command interfaces to their corresponding state interfaces. This has to run
-        // before the write buffers are built: build_sum_write_buffers resolves each
-        // interface's fallback out of this map, and while the linking came afterwards the
-        // map was always empty, so no interface has ever had a mirror-state fallback.
+        // Link command interfaces to their corresponding state interfaces
         RCLCPP_INFO(getLogger(), "Linking command interfaces to state interfaces...");
         for (auto &command_layout : ads_item_layouts_write_)
         {
@@ -373,12 +359,6 @@ namespace beckhoff_ads_hardware_interface
                 write_instruction.fallback_state_interface_name = "";
                 write_instruction.is_heartbeat = (interface_name == HEARTBEAT_INTERFACE_NAME);
 
-                // What to send when a controller stops writing this interface. Holding the
-                // last value is what every stack has actually had, so it stays the default.
-                // Mirroring the state interface is opt-in, because for a position command it
-                // turns "no command" into "stay put", which reads as a slow trajectory rather
-                // than as a stall. Zero is for velocity commands, where holding the last value
-                // means a dead controller keeps a feed-forward alive.
                 const auto policy_it = layout.fallback_policies_.find(interface_name);
                 write_instruction.fallback = (policy_it != layout.fallback_policies_.end())
                                                  ? policy_it->second
@@ -489,7 +469,6 @@ namespace beckhoff_ads_hardware_interface
 
                     // Add the interface name the layout
                     (*it).ros2_interfaces_.emplace(std::make_pair(plc_index, name));
-                    // a symbol is only skippable if every interface on it agrees
                     (*it).optional = (*it).optional && interface_optional;
                 }
             }
@@ -601,7 +580,6 @@ namespace beckhoff_ads_hardware_interface
                     // Add the command interface name the layout
                     (*it).ros2_interfaces_.emplace(std::make_pair(plc_index, name));
                     (*it).fallback_policies_.emplace(name, fallback_policy);
-                    // a symbol is only skippable if every interface on it agrees
                     (*it).optional = (*it).optional && interface_optional;
                 }
             }
@@ -610,10 +588,6 @@ namespace beckhoff_ads_hardware_interface
         init_ads_write_layout(joint_command_interfaces_);
         init_ads_write_layout(gpio_command_interfaces_);
 
-        // The heartbeat is the interface's own liveness signal, not a controller's. Owning it
-        // here is what makes it useful: it keeps advancing with no controller claiming
-        // anything, and it stops if the controller manager stalls or the writer thread wedges,
-        // both of which a controller-written counter would sail straight through.
         if (!heartbeat_symbol_.empty())
         {
             ADSDataLayout layout;
@@ -774,9 +748,7 @@ namespace beckhoff_ads_hardware_interface
 
             // Only the reader touches the read response buffer, so decode happens outside the
             // lock; the lock only guards the shared single-port round-trip against the writer.
-            // Let a waiting setpoint go first. Both threads share one AMS port, and a read
-            // started now holds it for a whole round trip, which at a 2 ms control period is
-            // most of the budget. Reads tolerate being a cycle late; setpoints do not.
+            // Let a pending setpoint take the shared port first.
             {
                 std::unique_lock<std::mutex> write_lock(write_mutex_);
                 if (write_pending_)
@@ -909,9 +881,6 @@ namespace beckhoff_ads_hardware_interface
 
             if (write_instruction.is_heartbeat)
             {
-                // Wrapping is fine and eventually certain: the PLC watches for the value
-                // changing, never for it incrementing by one, because the writer coalesces
-                // and the counter routinely jumps.
                 const uint32_t beat = ++heartbeat_counter_;
                 memcpy(ptr_write_buffer_destination_current, &beat, sizeof(beat));
                 continue;
@@ -925,8 +894,6 @@ namespace beckhoff_ads_hardware_interface
 
             if (std::isnan(val))
             {
-                // No controller wrote this interface on this cycle. Apply its fallback and
-                // count it, so a stall is distinguishable from a slow trajectory in the logs.
                 fallback_activations_.fetch_add(1, std::memory_order_relaxed);
 
                 if (write_instruction.fallback == CommandFallback::ZERO)
@@ -939,8 +906,8 @@ namespace beckhoff_ads_hardware_interface
                     val = get_state(write_instruction.fallback_state_interface_name);
                 }
 
-                // Hold the last value: leave this field of the buffer alone, which keeps
-                // whatever was packed on the most recent cycle that did carry a command.
+                // if we STILL don't have a fallback value on, don't update the write buffer.
+                // the last valid command is written
                 if (std::isnan(val))
                 {
                     continue;
@@ -1033,9 +1000,6 @@ namespace beckhoff_ads_hardware_interface
             std::lock_guard<std::mutex> lock(write_mutex_);
             if (write_pending_)
             {
-                // The previous buffer never made it onto the wire. That is the intended
-                // policy, since only the newest setpoints matter, but the rate at which it
-                // happens is how you tell whether the link is keeping up with the control loop.
                 write_coalesced_total_.fetch_add(1, std::memory_order_relaxed);
             }
             write_pending_request_ = ads_buffer_sum_write_request_;
