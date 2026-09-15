@@ -116,10 +116,6 @@ namespace beckhoff_ads_hardware_interface
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_configure(
         const rclcpp_lifecycle::State & /*previous_state*/)
     {
-        // Join the I/O threads before anything below touches ads_device_. Both loops call
-        // through it on every round-trip, and configure_ads_device() destroys the old device
-        // when it assigns the new one. A reconfigure after an error transition is the case
-        // that reaches here with the threads still running.
         stop_io_threads();
 
         // Release any symbol handles from a previous configure cycle before configure_ads_device()
@@ -145,9 +141,6 @@ namespace beckhoff_ads_hardware_interface
             RCLCPP_WARN(getLogger(), "Invalid read_poll_period_ms: %s. Running unpaced.", ex.what());
         }
 
-        // How long a comms outage may persist before read()/write() surface an error to the
-        // controller manager. Within this window the last cached values are held. 0 = fail on the
-        // first failed cycle (legacy behaviour). Absent or invalid = default.
         try
         {
             auto grace_it = info_.hardware_parameters.find("comms_outage_grace_ms");
@@ -280,10 +273,6 @@ namespace beckhoff_ads_hardware_interface
 
     bool BeckhoffADSHardwareInterface::build_sum_read_buffers()
     {
-        // Everything derived from the layouts is rebuilt from scratch on every configure cycle.
-        // The instruction vector used to accumulate instead, while the response buffer was
-        // resized to the current layout count, so an instruction surviving from a cycle that
-        // resolved more symbols carried an offset past the end of the smaller buffer.
         ads_read_instructions_.clear();
         polling_read_cache_.clear();
         ads_buffer_sum_read_request_.clear();
@@ -358,9 +347,6 @@ namespace beckhoff_ads_hardware_interface
     {
         RCLCPP_INFO(getLogger(), "Building ADS sum WRITE buffer...");
 
-        // As on the read side, a stale instruction would pack a command into a buffer that is
-        // no longer that large. write() runs on the control loop, so there the overrun is a
-        // heap write rather than a read.
         ads_write_instructions_.clear();
         ads_buffer_sum_write_request_.clear();
         ads_buffer_sum_write_response_.clear();
@@ -873,10 +859,7 @@ namespace beckhoff_ads_hardware_interface
                 continue;
             }
 
-            // A single missing symbol (0x710) reports per item while the round-trip itself
-            // succeeds. Hold that item's last value and keep going; a read-only telemetry symbol
-            // that is absent or renamed must not deactivate the whole hardware component. Only an
-            // outage that takes out every item is treated as a link failure.
+            // Per-item errors hold that item's last value; only every item failing is a link failure.
             size_t items_failed = 0;
             for (size_t i = 0; i < ads_read_instructions_.size(); ++i)
             {
@@ -903,15 +886,12 @@ namespace beckhoff_ads_hardware_interface
 
             if (items_failed == ads_read_instructions_.size() && !ads_read_instructions_.empty())
             {
-                // Every symbol is unavailable though the link answered (e.g. the program was
-                // swapped): treat as an outage so the grace window still backstops it.
                 record_read_failure();
             }
             else
             {
                 read_hard_fault_.store(false, std::memory_order_release);
-                // Declare recovery only after the link has been good for a stable period, so a
-                // flapping link logs one outage instead of an error/recovery pair per cycle.
+                // Declare recovery only after a stable period, so a flapping link logs once.
                 if (read_consecutive_failures_ > 0)
                 {
                     const std::chrono::steady_clock::time_point now_steady = std::chrono::steady_clock::now();
@@ -977,9 +957,6 @@ namespace beckhoff_ads_hardware_interface
 
             if (std::isnan(val))
             {
-                // No controller wrote this interface on this cycle. Apply its fallback, and
-                // count it only if something has commanded this interface before, so a real
-                // dropout registers and an interface nobody drives stays quiet.
                 if (write_instruction.has_been_commanded)
                 {
                     ++fallbacks_this_cycle;
@@ -1185,8 +1162,7 @@ namespace beckhoff_ads_hardware_interface
             }
 
             // One error code per write item, in request order: index i maps to layout i.
-            // A single rejected symbol must not deactivate the whole component; only an outage
-            // that fails every item is treated as a link failure.
+            // Only every item failing counts as a link failure.
             size_t items_failed = 0;
             for (size_t i = 0; i < num_items_write_; ++i)
             {
@@ -1209,8 +1185,7 @@ namespace beckhoff_ads_hardware_interface
             else
             {
                 write_hard_fault_.store(false, std::memory_order_release);
-                // Declare recovery only after the link has been good for a stable period, so a
-                // flapping link logs one outage instead of an error/recovery pair per round-trip.
+                // Declare recovery only after a stable period, so a flapping link logs once.
                 if (write_consecutive_failures_ > 0)
                 {
                     const std::chrono::steady_clock::time_point now_steady = std::chrono::steady_clock::now();

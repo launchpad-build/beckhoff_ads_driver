@@ -32,9 +32,6 @@ namespace utilities
   /**
    * @brief Parses an AMS port string with full range validation
    *
-   * std::stoul alone truncates values above 65535 silently when narrowed to
-   * uint16_t, so the value is range-checked before narrowing.
-   *
    * @param text The port text from the hardware parameters
    * @returns AmsPortParseResult with the parsed port, or an error description
    */
@@ -42,9 +39,6 @@ namespace utilities
 
   /**
    * @brief Returns an upper-case copy of the given text
-   *
-   * ::toupper on a plain char is undefined for negative values, so each
-   * character is cast through unsigned char first.
    *
    * @param text The text to convert
    * @returns The upper-cased copy

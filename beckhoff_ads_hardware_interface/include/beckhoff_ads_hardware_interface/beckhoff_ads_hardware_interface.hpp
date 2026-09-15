@@ -117,8 +117,6 @@ namespace beckhoff_ads_hardware_interface
     std::string fallback_state_interface_name; // The state interface name corresponding to the current command interface name
     CommandFallback fallback = CommandFallback::HOLD_LAST;
     bool is_heartbeat = false; // value comes from the interface's own counter, not a controller
-    // Set on the first cycle this interface carried a command. Until then its fallback is
-    // the normal case, not a dropout, and it must not count as one.
     bool has_been_commanded = false;
   };
 
@@ -141,10 +139,7 @@ namespace beckhoff_ads_hardware_interface
     hardware_interface::CallbackReturn on_shutdown(
         const rclcpp_lifecycle::State &previous_state) override;
 
-    // An ERROR out of read()/write() transitions the component straight here, without
-    // on_deactivate or on_shutdown running. Without this override the I/O threads kept
-    // running on a component the controller manager had already given up on, and the next
-    // on_configure replaced ads_device_ underneath them.
+    // Entered straight from an ERROR in read()/write(), with no on_deactivate first.
     hardware_interface::CallbackReturn on_error(
         const rclcpp_lifecycle::State &previous_state) override;
 
@@ -205,9 +200,7 @@ namespace beckhoff_ads_hardware_interface
     // A link must stay good this long before an outage is declared over.
     static constexpr std::chrono::seconds RECOVERY_STABLE_PERIOD{1};
 
-    // A comms outage shorter than this is ridden out on the last cached values; only once it
-    // outlives the window does read()/write() surface an error and let the controller manager
-    // tear the stack down. Overridable via the comms_outage_grace_ms hardware parameter.
+    // Overridable via the comms_outage_grace_ms hardware parameter.
     std::chrono::milliseconds comms_outage_grace_{1000};
 
     // ========= PLC ==============================
@@ -217,15 +210,11 @@ namespace beckhoff_ads_hardware_interface
     size_t plcTypeByteSize(PLCType type_enum);
 
     // ADS Communication objects
-    // The reader and writer threads dereference this on every round-trip without holding a
-    // lock, so every site that resets or replaces it has to join both threads first
-    // (stop_io_threads). Otherwise a thread is left calling a method on a destroyed AdsDevice,
-    // whose m_LocalPort is already freed.
+    // Reset or replace only after stop_io_threads() has joined both I/O threads.
     std::unique_ptr<AdsDevice> ads_device_; // Manages the route/connection to the PLC
     bool configure_ads_device();
 
-    // Joins the I/O threads, releases the symbol handles and drops the device, in the only
-    // order that is safe. Shared by on_shutdown and on_error.
+    // Joins the I/O threads, releases the handles and drops the device, in that order.
     void teardown_ads_device();
 
     // Releases every cached PLC symbol handle (ADSDataLayout::ads_handle_owner). Each handle's
@@ -275,22 +264,11 @@ namespace beckhoff_ads_hardware_interface
     std::atomic<uint64_t> read_failures_total_{0};
     std::atomic<uint64_t> write_failures_total_{0};
 
-    // Interface-cycles on which an interface that has carried a command before carried none
-    // and its fallback applied. Interfaces nothing has ever commanded are excluded, because
-    // write() clears every command interface to NaN after packing and a controller only
-    // writes the interfaces its most recent command message named. Counting those made the
-    // total grow every cycle whatever the controllers did, which is what it was meant to
-    // detect: measured at exactly 4.000 per cycle on the LMCF gantry after an engage,
-    // falling to 1.000 once a message named four of the five gpio commands, the remainder
-    // being an enable nothing had ever written.
+    // Excludes interfaces nothing has ever commanded.
     std::atomic<uint64_t> fallback_activations_{0};
 
-    // The same count over the most recent write() cycle only. Cumulative totals hide when a
-    // dropout started and when it stopped; the rate is what a reader wants.
     std::atomic<uint64_t> fallback_activations_cycle_{0};
 
-    // How many command interfaces have never carried a command. A quiet interface lands
-    // here once and stays put, so it is legible without inflating the dropout count.
     std::atomic<uint64_t> never_commanded_interfaces_{0};
 
     // Introspected mirrors. Only the control loop writes these.
