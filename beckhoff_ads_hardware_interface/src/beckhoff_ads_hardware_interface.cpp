@@ -344,11 +344,6 @@ namespace beckhoff_ads_hardware_interface
         ads_write_layout_configure();
 
         // Request handles for all symbolic PLC variable names
-        // An unresolved handle left in the sum buffers with a zero handle fails every
-        // round trip per item and read() then faults the component on the first cycle.
-        // Unresolved symbols are dropped from the buffers instead, and only the ones
-        // declared optional are tolerated; a required symbol that is missing fails
-        // configure, before anything is running.
         RCLCPP_INFO(getLogger(), "Fetching ADS handles for configured PLC variables...");
         bool required_symbol_missing = false;
 

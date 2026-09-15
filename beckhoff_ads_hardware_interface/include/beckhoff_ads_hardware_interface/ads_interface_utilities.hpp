@@ -119,9 +119,6 @@ namespace utilities
 
   /**
    * @brief Monotonically increasing sequence counter for streamed setpoints
-   *
-   * Matches PLC UDINT arithmetic: the value wraps at the 32-bit boundary
-   * rather than saturating, and the consumer handles the wrap.
    */
   class SetpointSequenceCounter
   {

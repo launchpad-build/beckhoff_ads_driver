@@ -61,7 +61,6 @@ namespace beckhoff_ads_hardware_interface
     ZERO,         // send zero; the right answer for a velocity or effort command
   };
 
-  // What produces the value packed for a write instruction on each cycle.
   enum class WriteValueSource
   {
     CONTROLLER,         // a ros2_control command interface
@@ -133,22 +132,16 @@ namespace beckhoff_ads_hardware_interface
     std::string fallback_state_interface_name; // The state interface name corresponding to the current command interface name
     CommandFallback fallback = CommandFallback::HOLD_LAST;
     WriteValueSource source = WriteValueSource::CONTROLLER;
-    // Set on the first cycle this interface carried a command. Until then its fallback is
-    // the normal case, not a dropout, and it must not count as one.
     bool has_been_commanded = false;
-    // Set once this field of the write buffer holds a value something provided: a command,
-    // a fallback, or the interface's initial_value at configure. An unseeded field must
-    // never reach the PLC; its whole item is left out of the transmitted request.
+    // An unseeded field keeps its whole item out of the transmitted request.
     bool seeded = false;
     size_t layout_index = 0; // index of the owning layout in ads_item_layouts_write_
-    // Resolved once at configure so write() never does a string lookup, takes a blocking
-    // wait or hits a throwing path on the control loop. Null for the synthetic sources.
+    // Resolved once at configure so write() stays non-blocking. Null for the synthetic sources.
     hardware_interface::CommandInterface::SharedPtr command_handle;
     hardware_interface::StateInterface::SharedPtr fallback_state_handle;
   };
 
-  // One whole decoded SUM-read sample, published atomically so a control cycle never
-  // mixes values from two different reads. The stamp tells consumers how old it is.
+  // One whole decoded SUM-read sample.
   struct ReadSample
   {
     std::vector<double> values; // one per read instruction, in instruction order
@@ -249,8 +242,7 @@ namespace beckhoff_ads_hardware_interface
     // Synthetic heartbeat name, never exported to ros2_control.
     static constexpr const char *HEARTBEAT_INTERFACE_NAME = "__ads_link_heartbeat";
 
-    // Synthetic interface names for the setpoint annotation, written in the same sum-write
-    // transaction as the setpoints they describe. Never exported to ros2_control.
+    // Synthetic names, never exported to ros2_control.
     static constexpr const char *SETPOINT_SEQUENCE_INTERFACE_NAME = "__ads_setpoint_sequence";
     static constexpr const char *SETPOINT_TIMESTAMP_INTERFACE_NAME = "__ads_setpoint_timestamp";
 
@@ -277,9 +269,7 @@ namespace beckhoff_ads_hardware_interface
 
     std::string setpoint_sequence_symbol_;  // PLC symbol for the sequence; empty disables it
     std::string setpoint_timestamp_symbol_; // PLC symbol for the timestamp; empty disables it
-    // Advanced once per write() cycle, so control-loop thread only. Counting cycles rather
-    // than transmitted buffers is deliberate: a coalesced buffer shows the PLC a jump,
-    // which tells it how many updates it lost.
+    // Advanced once per write() cycle, so control-loop thread only.
     utilities::SetpointSequenceCounter setpoint_sequence_counter_;
 
     // Connection target details kept for error logs (populated in configure_ads_device).
