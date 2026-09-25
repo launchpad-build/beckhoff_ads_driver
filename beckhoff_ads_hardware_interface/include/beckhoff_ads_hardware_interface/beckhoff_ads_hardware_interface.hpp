@@ -117,6 +117,7 @@ namespace beckhoff_ads_hardware_interface
     std::string fallback_state_interface_name; // The state interface name corresponding to the current command interface name
     CommandFallback fallback = CommandFallback::HOLD_LAST;
     bool is_heartbeat = false; // value comes from the interface's own counter, not a controller
+    bool has_been_commanded = false;
   };
 
   class BeckhoffADSHardwareInterface : public hardware_interface::SystemInterface
@@ -136,6 +137,10 @@ namespace beckhoff_ads_hardware_interface
         const rclcpp_lifecycle::State &previous_state) override;
 
     hardware_interface::CallbackReturn on_shutdown(
+        const rclcpp_lifecycle::State &previous_state) override;
+
+    // Entered straight from an ERROR in read()/write(), with no on_deactivate first.
+    hardware_interface::CallbackReturn on_error(
         const rclcpp_lifecycle::State &previous_state) override;
 
     hardware_interface::return_type read(
@@ -195,6 +200,9 @@ namespace beckhoff_ads_hardware_interface
     // A link must stay good this long before an outage is declared over.
     static constexpr std::chrono::seconds RECOVERY_STABLE_PERIOD{1};
 
+    // Overridable via the comms_outage_grace_ms hardware parameter.
+    std::chrono::milliseconds comms_outage_grace_{1000};
+
     // ========= PLC ==============================
 
     // PLC Type and Size Helpers
@@ -202,8 +210,12 @@ namespace beckhoff_ads_hardware_interface
     size_t plcTypeByteSize(PLCType type_enum);
 
     // ADS Communication objects
+    // Reset or replace only after stop_io_threads() has joined both I/O threads.
     std::unique_ptr<AdsDevice> ads_device_; // Manages the route/connection to the PLC
     bool configure_ads_device();
+
+    // Joins the I/O threads, releases the handles and drops the device, in that order.
+    void teardown_ads_device();
 
     // Releases every cached PLC symbol handle (ADSDataLayout::ads_handle_owner). Each handle's
     // deleter calls DeleteSymbolHandle through ads_device_, so this MUST run while ads_device_
@@ -251,7 +263,13 @@ namespace beckhoff_ads_hardware_interface
     std::atomic<uint64_t> write_coalesced_total_{0};
     std::atomic<uint64_t> read_failures_total_{0};
     std::atomic<uint64_t> write_failures_total_{0};
+
+    // Excludes interfaces nothing has ever commanded.
     std::atomic<uint64_t> fallback_activations_{0};
+
+    std::atomic<uint64_t> fallback_activations_cycle_{0};
+
+    std::atomic<uint64_t> never_commanded_interfaces_{0};
 
     // Introspected mirrors. Only the control loop writes these.
     double stat_read_rtt_ms_{0.0};
@@ -262,6 +280,8 @@ namespace beckhoff_ads_hardware_interface
     double stat_read_failures_{0.0};
     double stat_write_failures_{0.0};
     double stat_fallback_activations_{0.0};
+    double stat_fallback_activations_per_cycle_{0.0};
+    double stat_never_commanded_interfaces_{0.0};
     double stat_heartbeat_{0.0};
 
     std::vector<ReadInstruction> ads_read_instructions_;
@@ -291,7 +311,7 @@ namespace beckhoff_ads_hardware_interface
     std::vector<uint8_t> write_pending_request_; // latest packed SUM-write request awaiting send
     bool write_pending_ = false;                 // a fresh buffer is waiting (guarded by write_mutex_)
     bool write_stop_ = false;                     // stop request (guarded by write_mutex_)
-    std::atomic<bool> write_comms_ok_{true};      // last write transaction health, surfaced by write()
+    std::atomic<bool> write_hard_fault_{false};   // outage outlived the grace window, surfaced by write()
     // Consecutive failed SUM-write round-trips, for outage and recovery logs. Writer thread only.
     size_t write_consecutive_failures_ = 0;
     std::chrono::steady_clock::time_point write_outage_start_;
@@ -302,7 +322,7 @@ namespace beckhoff_ads_hardware_interface
     void reader_loop();
     std::thread read_thread_;
     std::atomic<bool> read_stop_{false};
-    std::atomic<bool> read_comms_ok_{true};         // last read transaction health, surfaced by read()
+    std::atomic<bool> read_hard_fault_{false};      // outage outlived the grace window, surfaced by read()
     std::deque<std::atomic<double>> polling_read_cache_; // one slot per read instruction; deque keeps addresses stable
     long long read_poll_period_ns_ = 0;             // optional pacing between SUM reads; 0 = unpaced
     // Consecutive failed SUM-read round-trips, for outage and recovery logs. Reader thread only.
