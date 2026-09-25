@@ -1,0 +1,1 @@
+The `command_interface_PLC` and `state_interface_PLC` xacro macros pass through the new `command_fallback` and `optional` interface parameters. Both are omitted when left empty, so existing descriptions produce byte-identical output. (xacro-interface-params)
