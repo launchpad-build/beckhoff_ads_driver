@@ -89,6 +89,9 @@ namespace beckhoff_ads_hardware_interface
 
     std::map<std::string, CommandFallback> fallback_policies_;
 
+    // Joint position and velocity default to critical; the critical interface parameter overrides.
+    std::map<std::string, bool> critical_policies_;
+
     // True only when every interface on this symbol declared optional="true".
     bool optional = false;
     bool handle_resolved = false;
@@ -110,6 +113,7 @@ namespace beckhoff_ads_hardware_interface
     std::string state_interface_name;
     // Resolved once at configure so read() stays non-blocking on the control loop.
     hardware_interface::StateInterface::SharedPtr state_handle;
+    bool critical = false;
   };
 
   struct WriteInstruction
@@ -143,6 +147,7 @@ namespace beckhoff_ads_hardware_interface
     std::vector<uint8_t> buffer;
     std::vector<size_t> layout_indices; // original layout index of each item in the buffer
     size_t num_items = 0;
+    std::chrono::steady_clock::time_point handoff_stamp{};
   };
 
   class BeckhoffADSHardwareInterface : public hardware_interface::SystemInterface
@@ -240,8 +245,18 @@ namespace beckhoff_ads_hardware_interface
     // A link must stay good this long before an outage is declared over.
     static constexpr std::chrono::seconds RECOVERY_STABLE_PERIOD{1};
 
-    // Overridable via the comms_outage_grace_ms hardware parameter.
-    std::chrono::milliseconds comms_outage_grace_{1000};
+    // Overridable via comms_outage_grace_ms; the default matches the PLC's ROS link watchdog.
+    std::chrono::milliseconds comms_outage_grace_{100};
+
+    // outage_behaviour=resume lets a hard fault clear itself on link recovery.
+    bool outage_latches_{true};
+
+    // Overridable via read_staleness_timeout_ms; 0 disables; raised to three poll periods when paced reading is slower.
+    long long read_staleness_timeout_ns_{100000000};
+
+    // Overridable via activation_first_sample_timeout_ms; 0 skips the wait.
+    std::chrono::milliseconds activation_first_sample_timeout_{1000};
+    std::atomic<uint64_t> read_samples_published_{0}; // bumped by the reader on every publish
 
     // ========= PLC ==============================
 
@@ -307,6 +322,8 @@ namespace beckhoff_ads_hardware_interface
     // ===== ADS transaction statistics ==========================================
     std::atomic<long long> read_rtt_ns_{0};
     std::atomic<long long> write_rtt_ns_{0};
+    std::atomic<long long> write_buffer_age_ns_{0};      // handoff to send start, sampled at dequeue
+    std::atomic<long long> write_handoff_latency_ns_{0}; // handoff to send complete
     std::atomic<uint64_t> read_transactions_total_{0};
     std::atomic<uint64_t> write_transactions_total_{0};
     std::atomic<uint64_t> write_coalesced_total_{0};
@@ -323,6 +340,8 @@ namespace beckhoff_ads_hardware_interface
     // Introspected mirrors. Only the control loop writes these.
     double stat_read_rtt_ms_{0.0};
     double stat_write_rtt_ms_{0.0};
+    double stat_write_buffer_age_ms_{0.0};
+    double stat_write_handoff_latency_ms_{0.0};
     double stat_read_transactions_{0.0};
     double stat_write_transactions_{0.0};
     double stat_write_coalesced_{0.0};
@@ -380,6 +399,8 @@ namespace beckhoff_ads_hardware_interface
     utilities::LatestSampleBuffer<ReadSample> read_sample_buffer_;
     std::vector<double> last_decoded_values_; // reader thread only
     uint64_t read_sample_sequence_ = 0;       // reader thread only
+    // When each item's current per-item failure streak began; reader thread only.
+    std::vector<std::optional<std::chrono::steady_clock::time_point>> item_failure_start_;
     long long read_poll_period_ns_ = 0;             // optional pacing between SUM reads; 0 = unpaced
     // Consecutive failed SUM-read round-trips, for outage and recovery logs. Reader thread only.
     size_t read_consecutive_failures_ = 0;
