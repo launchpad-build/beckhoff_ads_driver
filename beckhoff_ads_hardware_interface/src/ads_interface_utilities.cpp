@@ -54,5 +54,32 @@ namespace utilities
     return result;
   }
 
+  void compactSumWriteRequest(
+      const std::vector<uint8_t> &full_request,
+      const std::vector<SumWriteItemSpan> &spans,
+      const std::vector<uint8_t> &include,
+      std::vector<uint8_t> &compact_request,
+      std::vector<size_t> &included_indices)
+  {
+    compact_request.clear();
+    included_indices.clear();
+    for (size_t i = 0; i < spans.size(); ++i)
+    {
+      if (include[i] != 0)
+      {
+        compact_request.insert(compact_request.end(),
+                               full_request.begin() + spans[i].header_offset,
+                               full_request.begin() + spans[i].header_offset + spans[i].header_length);
+        included_indices.push_back(i);
+      }
+    }
+    for (const size_t i : included_indices)
+    {
+      compact_request.insert(compact_request.end(),
+                             full_request.begin() + spans[i].data_offset,
+                             full_request.begin() + spans[i].data_offset + spans[i].data_length);
+    }
+  }
+
 } // namespace utilities
 } // namespace beckhoff_ads_hardware_interface
