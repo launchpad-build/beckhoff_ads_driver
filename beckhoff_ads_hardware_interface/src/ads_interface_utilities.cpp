@@ -175,6 +175,29 @@ namespace utilities
     return result;
   }
 
+  SetpointSequenceCounter::SetpointSequenceCounter(uint32_t start)
+      : value_(start)
+  {
+  }
+
+  uint32_t SetpointSequenceCounter::next()
+  {
+    value_ += 1u;
+    const uint32_t result = value_;
+    return result;
+  }
+
+  uint32_t SetpointSequenceCounter::current() const
+  {
+    return value_;
+  }
+
+  double monotonicSeconds(const std::chrono::steady_clock::time_point &instant)
+  {
+    const std::chrono::duration<double> seconds = instant.time_since_epoch();
+    return seconds.count();
+  }
+
   void compactSumWriteRequest(
       const std::vector<uint8_t> &full_request,
       const std::vector<SumWriteItemSpan> &spans,
