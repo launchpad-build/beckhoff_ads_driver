@@ -700,6 +700,9 @@ namespace beckhoff_ads_hardware_interface
                                                         write_instruction.write_buffer_offset_data;
                             write_instruction.seeded =
                                 encode_plc_element(write_instruction.plc_type, initial, seed_destination);
+                            // The initial value seeds the buffer; it is not a command, so the first write() must not count it as one.
+                            std::ignore = set_command(write_instruction.command_handle,
+                                                      std::numeric_limits<double>::quiet_NaN(), true);
                         }
                     }
 
