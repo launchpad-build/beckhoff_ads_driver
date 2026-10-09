@@ -1,0 +1,1 @@
+Interfaces can map onto fields of a PLC structure with the `byte_offset` and `byte_size` interface parameters, each field with its own type, so a whole structure is read or written in one transfer. Configure fails when the fields overlap, run past `byte_size`, or `byte_size` differs from the structure's size on the PLC. Descriptions without `byte_offset` are unchanged.

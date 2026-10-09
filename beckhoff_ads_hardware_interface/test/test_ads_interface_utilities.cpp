@@ -7,7 +7,10 @@
 // The file is considered confidential.
 
 #include <chrono>
+#include <cstring>
 #include <limits>
+#include <optional>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -171,4 +174,56 @@ TEST(ToUpperCopy, ToleratesBytesOutsideTheAsciiRange)
   const std::string result = utilities::toUpperCopy(with_high_bytes);
   EXPECT_EQ(result.substr(0, 3), "LRE");
   EXPECT_EQ(result.back(), 'L');
+}
+
+TEST(ParseByteCount, AcceptsNonNegativeWholeNumbers)
+{
+  EXPECT_EQ(utilities::parseByteCount("0").value, 0u);
+  EXPECT_TRUE(utilities::parseByteCount("0").valid);
+  EXPECT_EQ(utilities::parseByteCount("255").value, 255u);
+}
+
+TEST(ParseByteCount, RejectsSignsFractionsAndText)
+{
+  for (const char *text : {"", "-4", "+4", "4.0", "4 ", "0x10", "abc"})
+  {
+    EXPECT_FALSE(utilities::parseByteCount(text).valid) << text;
+  }
+}
+
+TEST(ValidateStructFields, AcceptsFieldsThatTileOrLeaveGaps)
+{
+  EXPECT_EQ(utilities::validateStructFields(66, {{"version", 0, 4}, {"x", 16, 8}, {"stop", 65, 1}}), "");
+  EXPECT_EQ(utilities::validateStructFields(8, {{"b", 4, 4}, {"a", 0, 4}}), "");
+  EXPECT_EQ(utilities::validateStructFields(8, {}), "");
+}
+
+TEST(ValidateStructFields, RejectsAFieldRunningPastTheEnd)
+{
+  EXPECT_NE(utilities::validateStructFields(16, {{"a", 12, 8}}), "");
+  EXPECT_NE(utilities::validateStructFields(16, {{"a", 17, 1}}), "");
+  EXPECT_NE(utilities::validateStructFields(16, {{"a", 16, 1}}), "");
+}
+
+TEST(ValidateStructFields, RejectsOverlappingFields)
+{
+  EXPECT_NE(utilities::validateStructFields(16, {{"a", 0, 4}, {"b", 2, 2}}), "");
+  EXPECT_NE(utilities::validateStructFields(16, {{"b", 3, 1}, {"a", 0, 4}}), "");
+}
+
+TEST(SymbolSizeFromEntry, ReadsTheSizeFieldOfTheHeader)
+{
+  std::vector<uint8_t> entry(64, 0);
+  const uint32_t size = 255;
+  std::memcpy(entry.data() + 12, &size, sizeof(size));
+  const std::optional<uint32_t> parsed = utilities::symbolSizeFromEntry(entry, 40);
+  ASSERT_TRUE(parsed.has_value());
+  EXPECT_EQ(*parsed, 255u);
+}
+
+TEST(SymbolSizeFromEntry, RejectsAReplyShorterThanTheHeader)
+{
+  std::vector<uint8_t> entry(64, 0);
+  EXPECT_FALSE(utilities::symbolSizeFromEntry(entry, 29).has_value());
+  EXPECT_FALSE(utilities::symbolSizeFromEntry(std::vector<uint8_t>(16, 0), 16).has_value());
 }

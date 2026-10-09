@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,52 @@ namespace utilities
    * @returns AmsPortParseResult with the parsed port, or an error description
    */
   AmsPortParseResult parseAmsPort(const std::string &text);
+
+  /**
+   * @brief Outcome of parsing a byte count or byte offset
+   */
+  struct ByteCountParseResult
+  {
+    bool valid{false};
+    size_t value{0};
+    std::string error;
+  };
+
+  /**
+   * @brief Parses a non-negative decimal byte count or offset
+   *
+   * @param text The parameter text
+   * @returns ByteCountParseResult with the value, or an error description
+   */
+  ByteCountParseResult parseByteCount(const std::string &text);
+
+  /**
+   * @brief One field of a PLC structure, as the bytes it occupies
+   */
+  struct StructFieldSpan
+  {
+    std::string name;
+    size_t offset{0};
+    size_t size{0};
+  };
+
+  /**
+   * @brief Checks that every field lies inside the structure and no two fields overlap
+   *
+   * @param byte_size Size of the structure on the PLC
+   * @param fields The fields mapped onto it
+   * @returns An error description, or empty when the fields fit
+   */
+  std::string validateStructFields(size_t byte_size, std::vector<StructFieldSpan> fields);
+
+  /**
+   * @brief Reads the symbol size from an ADSIGRP_SYM_INFOBYNAMEEX reply
+   *
+   * @param entry The reply buffer, starting with the AdsSymbolEntry header
+   * @param bytes_read How many bytes of the buffer the PLC filled
+   * @returns The symbol size in bytes, or nothing when the reply is too short to hold the header
+   */
+  std::optional<uint32_t> symbolSizeFromEntry(const std::vector<uint8_t> &entry, size_t bytes_read);
 
   /**
    * @brief Returns an upper-case copy of the given text

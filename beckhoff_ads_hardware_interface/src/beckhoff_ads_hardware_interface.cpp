@@ -15,6 +15,7 @@
 #include <vector>
 #include <cstdint>
 #include <cstring> // std::memcpy
+#include <sstream>
 #include <chrono>
 #include <thread>
 #include <tuple>
@@ -340,8 +341,19 @@ namespace beckhoff_ads_hardware_interface
         }
 
         // Fill the ADSDataLayout vectors for read and write operations
+        layout_errors_.clear();
         ads_read_layout_configure();
         ads_write_layout_configure();
+        validate_struct_layouts(ads_item_layouts_read_, "read");
+        validate_struct_layouts(ads_item_layouts_write_, "write");
+        if (!layout_errors_.empty())
+        {
+            for (const std::string &error : layout_errors_)
+            {
+                RCLCPP_FATAL(getLogger(), "\t%s", error.c_str());
+            }
+            return hardware_interface::CallbackReturn::ERROR;
+        }
 
         // Request handles for all symbolic PLC variable names
         RCLCPP_INFO(getLogger(), "Fetching ADS handles for configured PLC variables...");
@@ -357,6 +369,17 @@ namespace beckhoff_ads_hardware_interface
                     layout.ads_handle_owner.emplace(device.GetHandle(layout.plc_name_symbolic));
                     layout.ads_handle = **layout.ads_handle_owner;
                     layout.handle_resolved = true;
+                    if (layout.structured)
+                    {
+                        // A structure that grew or shrank on the PLC shifts every field after the change.
+                        const std::string size_error = check_struct_size(layout, device);
+                        if (!size_error.empty())
+                        {
+                            RCLCPP_FATAL(getLogger(), "\tStructured %s symbol '%s': %s",
+                                         direction, layout.plc_name_symbolic.c_str(), size_error.c_str());
+                            required_symbol_missing = true;
+                        }
+                    }
                 }
                 catch (const std::exception &ex)
                 {
@@ -410,6 +433,10 @@ namespace beckhoff_ads_hardware_interface
         RCLCPP_INFO(getLogger(), "Linking command interfaces to state interfaces...");
         for (auto &command_layout : ads_item_layouts_write_)
         {
+            if (command_layout.structured)
+            {
+                continue; // fields are paired by array index only
+            }
             for (const auto &state_layout : ads_item_layouts_read_)
             {
                 if (command_layout.plc_name_symbolic == state_layout.plc_name_symbolic)
@@ -492,7 +519,7 @@ namespace beckhoff_ads_hardware_interface
             size_t total_data_block_size = 0;
             for (const auto &layout : ads_item_layouts_read_)
             {
-                total_data_block_size += layout.plc_element_byte_size * layout.num_elements;
+                total_data_block_size += layout.item_byte_size();
             }
 
             ads_buffer_sum_read_response_.resize(total_error_block_size + total_data_block_size);
@@ -508,7 +535,7 @@ namespace beckhoff_ads_hardware_interface
                 ADS_ITEM_REQ_HEADER header;
                 header.indexGroup = ADSIGRP_SYM_VALBYHND;
                 header.indexOffset = layout.ads_handle;
-                header.NumBytesData = layout.plc_element_byte_size * layout.num_elements;
+                header.NumBytesData = layout.item_byte_size();
                 const uint8_t *ptr = reinterpret_cast<const uint8_t *>(&header);
                 ads_buffer_sum_read_request_.insert(ads_buffer_sum_read_request_.end(), ptr, ptr + sizeof(ADS_ITEM_REQ_HEADER));
 
@@ -518,8 +545,8 @@ namespace beckhoff_ads_hardware_interface
                     // Fill the read instruction vector
                     ReadInstruction read_instruction;
                     read_instruction.read_buffer_offset_error_code = layout.offset_in_read_response_error;
-                    read_instruction.read_buffer_offset_data = layout.offset_in_read_response_data + index * layout.plc_element_byte_size;
-                    read_instruction.plc_type = layout.plc_type;
+                    read_instruction.read_buffer_offset_data = layout.offset_in_read_response_data + layout.field_byte_offset(index);
+                    read_instruction.plc_type = layout.field_type(interface_name);
                     read_instruction.state_interface_name = interface_name;
                     read_instruction.state_handle = get_state_interface_handle(interface_name);
                     const auto critical_it = layout.critical_policies_.find(interface_name);
@@ -576,7 +603,7 @@ namespace beckhoff_ads_hardware_interface
             size_t total_header_size = num_items_write_ * sizeof(ADS_ITEM_REQ_HEADER);
             for (const auto &layout : ads_item_layouts_write_)
             {
-                total_data_size += layout.plc_element_byte_size * layout.num_elements;
+                total_data_size += layout.item_byte_size();
             }
 
             ads_buffer_sum_write_request_.resize(total_header_size + total_data_size);
@@ -590,7 +617,7 @@ namespace beckhoff_ads_hardware_interface
             {
                 header_block_ptr[i].indexGroup = ADSIGRP_SYM_VALBYHND;
                 header_block_ptr[i].indexOffset = layout.ads_handle;
-                header_block_ptr[i].NumBytesData = layout.plc_element_byte_size * layout.num_elements;
+                header_block_ptr[i].NumBytesData = layout.item_byte_size();
 
                 layout.offset_in_write_request_data = total_header_size + current_data_offset;
 
@@ -607,8 +634,8 @@ namespace beckhoff_ads_hardware_interface
                 {
                     // Fill the write instruction vector
                     WriteInstruction write_instruction;
-                    write_instruction.write_buffer_offset_data = layout.offset_in_write_request_data + index * layout.plc_element_byte_size;
-                    write_instruction.plc_type = layout.plc_type;
+                    write_instruction.write_buffer_offset_data = layout.offset_in_write_request_data + layout.field_byte_offset(index);
+                    write_instruction.plc_type = layout.field_type(interface_name);
                     write_instruction.command_interface_name = interface_name;
                     write_instruction.fallback_state_interface_name = "";
                     write_instruction.source = classifyWriteValueSource(interface_name);
@@ -616,6 +643,24 @@ namespace beckhoff_ads_hardware_interface
                     if (write_instruction.source == WriteValueSource::CONTROLLER)
                     {
                         write_instruction.command_handle = get_command_interface_handle(interface_name);
+                    }
+
+                    const auto seed_it = seed_from_state_.find(interface_name);
+                    if (seed_it != seed_from_state_.end())
+                    {
+                        const auto read_it = std::find_if(
+                            ads_read_instructions_.begin(), ads_read_instructions_.end(),
+                            [&seed_it](const ReadInstruction &read_instruction)
+                            { return read_instruction.state_interface_name == seed_it->second; });
+                        if (read_it == ads_read_instructions_.end())
+                        {
+                            RCLCPP_FATAL(getLogger(),
+                                         "\tCommand interface '%s' seeds from '%s', which is not read from the PLC.",
+                                         interface_name.c_str(), seed_it->second.c_str());
+                            return false;
+                        }
+                        write_instruction.seed_read_index =
+                            static_cast<size_t>(std::distance(ads_read_instructions_.begin(), read_it));
                     }
 
                     const auto policy_it = layout.fallback_policies_.find(interface_name);
@@ -747,6 +792,17 @@ namespace beckhoff_ads_hardware_interface
 
                 warn_if_joint_motion_interface_is_32_bit(name, descr, is_joint, plc_type_str);
 
+                if (descr.interface_info.parameters.count("byte_offset"))
+                {
+                    const std::optional<size_t> layout_index =
+                        add_struct_field(ads_item_layouts_read_, name, descr, interface_optional);
+                    if (layout_index)
+                    {
+                        ads_item_layouts_read_[*layout_index].critical_policies_.emplace(name, interface_critical);
+                    }
+                    continue;
+                }
+
                 // If this is the first time we see this symbol, create the layout
                 if (processed_plc_symbols.find(plc_symbol) == processed_plc_symbols.end())
                 {
@@ -797,6 +853,7 @@ namespace beckhoff_ads_hardware_interface
 
         // Reserve worst-case scenario for layouts (each interface targets a different PLC symbol)
         ads_item_layouts_write_.clear();
+        seed_from_state_.clear();
         ads_item_layouts_write_.reserve(num_command_interfaces);
 
         // Keep track of multiple interfaces targeting the same PLC symbol of type ARRAY[x], but different index
@@ -856,6 +913,19 @@ namespace beckhoff_ads_hardware_interface
                 const bool interface_optional = descr.interface_info.parameters.count("optional") &&
                                                 descr.interface_info.parameters.at("optional") == "true";
 
+                register_seed_from_state(name, descr);
+
+                if (descr.interface_info.parameters.count("byte_offset"))
+                {
+                    const std::optional<size_t> layout_index =
+                        add_struct_field(ads_item_layouts_write_, name, descr, interface_optional);
+                    if (layout_index)
+                    {
+                        ads_item_layouts_write_[*layout_index].fallback_policies_.emplace(name, fallback_policy);
+                    }
+                    continue;
+                }
+
                 if (processed_plc_symbols.find(plc_symbol) == processed_plc_symbols.end())
                 {
                     ADSDataLayout layout;
@@ -902,14 +972,56 @@ namespace beckhoff_ads_hardware_interface
         }
         if (!setpoint_sequence_symbol_.empty())
         {
-            append_synthetic_write_layout(setpoint_sequence_symbol_, PLCType::UDINT,
-                                          SETPOINT_SEQUENCE_INTERFACE_NAME);
+            add_synthetic_write_value(setpoint_sequence_symbol_, "setpoint_sequence_byte_offset", PLCType::UDINT,
+                                      SETPOINT_SEQUENCE_INTERFACE_NAME);
+        }
+        else if (info_.hardware_parameters.count("setpoint_sequence_byte_offset"))
+        {
+            layout_errors_.push_back("setpoint_sequence_byte_offset is set but setpoint_sequence_plc_symbol is not.");
         }
         if (!setpoint_timestamp_symbol_.empty())
         {
-            append_synthetic_write_layout(setpoint_timestamp_symbol_, PLCType::LREAL,
-                                          SETPOINT_TIMESTAMP_INTERFACE_NAME);
+            add_synthetic_write_value(setpoint_timestamp_symbol_, "setpoint_time_byte_offset", PLCType::LREAL,
+                                      SETPOINT_TIMESTAMP_INTERFACE_NAME);
         }
+        else if (info_.hardware_parameters.count("setpoint_time_byte_offset"))
+        {
+            layout_errors_.push_back("setpoint_time_byte_offset is set but setpoint_time_plc_symbol is not.");
+        }
+    }
+
+    void BeckhoffADSHardwareInterface::add_synthetic_write_value(
+        const std::string &plc_symbol, const char *offset_parameter, PLCType plc_type, const char *interface_name)
+    {
+        const auto offset_it = info_.hardware_parameters.find(offset_parameter);
+        if (offset_it == info_.hardware_parameters.end())
+        {
+            append_synthetic_write_layout(plc_symbol, plc_type, interface_name);
+            return;
+        }
+
+        const std::string prefix = std::string(offset_parameter) + " on '" + plc_symbol + "': ";
+        const utilities::ByteCountParseResult offset = utilities::parseByteCount(offset_it->second);
+        if (!offset.valid)
+        {
+            layout_errors_.push_back(prefix + "invalid value '" + offset_it->second + "': " + offset.error + ".");
+            return;
+        }
+        auto it = std::find_if(ads_item_layouts_write_.begin(), ads_item_layouts_write_.end(),
+                               [&plc_symbol](const ADSDataLayout &layout)
+                               { return layout.plc_name_symbolic == plc_symbol; });
+        if (it == ads_item_layouts_write_.end() || !it->structured)
+        {
+            layout_errors_.push_back(prefix + "no command interface maps that symbol by byte_offset, so it has no structure to hold the value.");
+            return;
+        }
+        if (!it->ros2_interfaces_.emplace(offset.value, interface_name).second)
+        {
+            layout_errors_.push_back(prefix + "byte " + std::to_string(offset.value) + " is already mapped to '" +
+                                     it->ros2_interfaces_.at(offset.value) + "'.");
+            return;
+        }
+        it->field_types_.emplace(interface_name, plc_type);
     }
 
     void BeckhoffADSHardwareInterface::append_synthetic_write_layout(
@@ -922,6 +1034,156 @@ namespace beckhoff_ads_hardware_interface
         layout.plc_element_byte_size = plcTypeByteSize(plc_type);
         layout.ros2_interfaces_.emplace(0, interface_name);
         ads_item_layouts_write_.push_back(std::move(layout));
+    }
+
+    std::optional<size_t> BeckhoffADSHardwareInterface::add_struct_field(
+        std::vector<ADSDataLayout> &layouts, const std::string &interface_name,
+        const hardware_interface::InterfaceDescription &description, bool interface_optional)
+    {
+        const auto &params = description.interface_info.parameters;
+        const std::string &plc_symbol = params.at("PLC_symbol");
+        auto reject = [&](const std::string &why) -> std::optional<size_t>
+        {
+            layout_errors_.push_back("Interface '" + interface_name + "' on '" + plc_symbol + "': " + why + ".");
+            return std::nullopt;
+        };
+
+        if (params.count("index") || params.count("n_elements"))
+        {
+            return reject("byte_offset addresses a structure field and cannot be combined with index or n_elements");
+        }
+        const utilities::ByteCountParseResult offset = utilities::parseByteCount(params.at("byte_offset"));
+        if (!offset.valid)
+        {
+            return reject("invalid byte_offset '" + params.at("byte_offset") + "': " + offset.error);
+        }
+        const PLCType plc_type = strToPlcType(params.at("PLC_type"));
+        if (plc_type == PLCType::UNKNOWN || plc_type == PLCType::STRING)
+        {
+            return reject("unsupported PLC_type '" + params.at("PLC_type") + "'");
+        }
+        size_t byte_size = 0;
+        if (params.count("byte_size"))
+        {
+            const utilities::ByteCountParseResult size = utilities::parseByteCount(params.at("byte_size"));
+            if (!size.valid || size.value == 0)
+            {
+                return reject("invalid byte_size '" + params.at("byte_size") + "'");
+            }
+            byte_size = size.value;
+        }
+
+        auto it = std::find_if(layouts.begin(), layouts.end(), [&plc_symbol](const ADSDataLayout &layout)
+                               { return layout.plc_name_symbolic == plc_symbol; });
+        if (it == layouts.end())
+        {
+            ADSDataLayout layout;
+            layout.plc_name_symbolic = plc_symbol;
+            layout.structured = true;
+            layout.num_elements = 1;
+            layout.plc_type = PLCType::BYTE;
+            layout.plc_element_byte_size = 1;
+            layout.optional = interface_optional;
+            layouts.push_back(std::move(layout));
+            it = std::prev(layouts.end());
+        }
+        else if (!it->structured)
+        {
+            return reject("the symbol is also mapped by index; map every interface on it by byte_offset");
+        }
+        else
+        {
+            it->optional = it->optional && interface_optional;
+        }
+
+        if (byte_size != 0)
+        {
+            if (it->struct_byte_size != 0 && it->struct_byte_size != byte_size)
+            {
+                return reject("byte_size " + std::to_string(byte_size) + " differs from the " +
+                              std::to_string(it->struct_byte_size) + " declared on another interface");
+            }
+            it->struct_byte_size = byte_size;
+        }
+        if (!it->ros2_interfaces_.emplace(offset.value, interface_name).second)
+        {
+            return reject("byte_offset " + std::to_string(offset.value) + " is already mapped to '" +
+                          it->ros2_interfaces_.at(offset.value) + "'");
+        }
+        it->field_types_.emplace(interface_name, plc_type);
+        return static_cast<size_t>(std::distance(layouts.begin(), it));
+    }
+
+    std::string BeckhoffADSHardwareInterface::check_struct_size(const ADSDataLayout &layout,
+                                                                const AdsDevice &device) const
+    {
+        // The reply carries the AdsSymbolEntry header followed by the name, type and comment strings.
+        std::vector<uint8_t> entry(4096);
+        uint32_t bytes_read = 0;
+        const std::string &name = layout.plc_name_symbolic;
+        const long status = device.ReadWriteReqEx2(ADSIGRP_SYM_INFOBYNAMEEX, 0, entry.size(), entry.data(),
+                                                   name.size(), name.c_str(), &bytes_read);
+        std::string error;
+        if (status != ADSERR_NOERR)
+        {
+            std::ostringstream text;
+            text << "could not read its size from the PLC (error 0x" << std::hex << std::uppercase << status
+                 << ": " << adsErrorText(status) << ").";
+            error = text.str();
+        }
+        else
+        {
+            const std::optional<uint32_t> plc_size = utilities::symbolSizeFromEntry(entry, bytes_read);
+            if (!plc_size)
+            {
+                error = "the PLC's symbol information was too short to hold its size.";
+            }
+            else if (*plc_size != layout.struct_byte_size)
+            {
+                error = "it is " + std::to_string(*plc_size) + " bytes on the PLC but byte_size is " +
+                        std::to_string(layout.struct_byte_size) +
+                        ". Update the byte_offset map to the PLC's structure.";
+            }
+        }
+        return error;
+    }
+
+    void BeckhoffADSHardwareInterface::validate_struct_layouts(const std::vector<ADSDataLayout> &layouts,
+                                                               const char *direction)
+    {
+        std::map<std::string, size_t> symbol_counts;
+        for (const auto &layout : layouts)
+        {
+            ++symbol_counts[layout.plc_name_symbolic];
+        }
+        for (const auto &layout : layouts)
+        {
+            if (!layout.structured)
+            {
+                continue;
+            }
+            const std::string prefix = std::string("Structured ") + direction + " symbol '" + layout.plc_name_symbolic + "': ";
+            if (symbol_counts[layout.plc_name_symbolic] > 1)
+            {
+                layout_errors_.push_back(prefix + "also mapped by index; map every interface on it by byte_offset.");
+                continue;
+            }
+            if (layout.struct_byte_size == 0)
+            {
+                layout_errors_.push_back(prefix + "no interface declares byte_size.");
+                continue;
+            }
+            std::vector<utilities::StructFieldSpan> fields;
+            for (const auto &[offset, interface_name] : layout.ros2_interfaces_)
+            {
+                fields.push_back({interface_name, offset, plcTypeByteSize(layout.field_type(interface_name))});
+            }
+            const std::string error = utilities::validateStructFields(layout.struct_byte_size, fields);
+            if (!error.empty())
+            {
+                layout_errors_.push_back(prefix + error + ".");
+            }
+        }
     }
 
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_activate(
@@ -963,7 +1225,80 @@ namespace beckhoff_ads_hardware_interface
             }
         }
 
+        if (result == CallbackReturn::SUCCESS && !seed_commands_from_state())
+        {
+            stop_io_threads();
+            result = CallbackReturn::FAILURE;
+        }
+
         return result;
+    }
+
+    bool BeckhoffADSHardwareInterface::seed_commands_from_state()
+    {
+        bool ok = true;
+        if (seed_from_state_.empty())
+        {
+            return ok;
+        }
+
+        read_sample_buffer_.refreshReadSlot();
+        const ReadSample &sample = read_sample_buffer_.readSlot();
+        for (auto &write_instruction : ads_write_instructions_)
+        {
+            if (!write_instruction.seed_read_index)
+            {
+                continue;
+            }
+            const std::string &state_name = ads_read_instructions_[*write_instruction.seed_read_index].state_interface_name;
+            if (sample.sequence == 0)
+            {
+                RCLCPP_WARN(getLogger(), "No PLC sample yet to seed '%s' from '%s'; it waits for its first command.",
+                            write_instruction.command_interface_name.c_str(), state_name.c_str());
+                continue;
+            }
+            const double value = sample.values[*write_instruction.seed_read_index];
+            if (!std::isfinite(value) ||
+                !encode_plc_element(write_instruction.plc_type, value,
+                                    ads_buffer_sum_write_request_.data() + write_instruction.write_buffer_offset_data))
+            {
+                RCLCPP_ERROR(getLogger(), "Cannot seed '%s': '%s' reads %f.",
+                             write_instruction.command_interface_name.c_str(), state_name.c_str(), value);
+                ok = false;
+                continue;
+            }
+            write_instruction.seeded = true;
+            RCLCPP_INFO(getLogger(), "Seeded '%s' with %f from '%s'.",
+                        write_instruction.command_interface_name.c_str(), value, state_name.c_str());
+        }
+        return ok;
+    }
+
+    void BeckhoffADSHardwareInterface::register_seed_from_state(
+        const std::string &interface_name, const hardware_interface::InterfaceDescription &description)
+    {
+        const auto seed_it = description.interface_info.parameters.find("seed_from_state");
+        if (seed_it == description.interface_info.parameters.end())
+        {
+            return;
+        }
+        const std::string &state_name = seed_it->second;
+        const bool state_exists = joint_state_interfaces_.count(state_name) || gpio_state_interfaces_.count(state_name) ||
+                                  sensor_state_interfaces_.count(state_name);
+        if (!description.interface_info.initial_value.empty())
+        {
+            layout_errors_.push_back("Interface '" + interface_name +
+                                     "': seed_from_state and initial_value both set its first value; keep one.");
+        }
+        else if (!state_exists)
+        {
+            layout_errors_.push_back("Interface '" + interface_name + "': seed_from_state names '" + state_name +
+                                     "', which is not a state interface of this hardware.");
+        }
+        else
+        {
+            seed_from_state_.emplace(interface_name, state_name);
+        }
     }
 
     hardware_interface::CallbackReturn BeckhoffADSHardwareInterface::on_deactivate(

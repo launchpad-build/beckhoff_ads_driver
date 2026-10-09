@@ -1,0 +1,1 @@
+`setpoint_sequence_byte_offset` and `setpoint_time_byte_offset` write the setpoint sequence and time into a field of the structure their symbol names, so they travel in the same transfer as the setpoints. Without them the symbols are written as before.

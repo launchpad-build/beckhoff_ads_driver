@@ -35,6 +35,10 @@ These parameters define the connection to the target PLC.
 | `plc_ams_net_id`   | `string` | The AMS NetID of the target PLC (e.g., "192.168.1.1.1.1"). |
 | `local_ams_net_id` | `string` | The AMS NetID of the computer running ROS.      |
 | `plc_ams_port`     | `string` | The AMS Port of the PLC runtime (e.g., "851").  |
+| `setpoint_sequence_plc_symbol` | `string` | (Optional) UDINT symbol advanced by one every write cycle. |
+| `setpoint_sequence_byte_offset` | `integer` | (Optional) Writes the sequence into the structure `setpoint_sequence_plc_symbol` names, at this byte offset. |
+| `setpoint_time_plc_symbol` | `string` | (Optional) LREAL symbol set to the steady-clock time of every write cycle, in seconds. |
+| `setpoint_time_byte_offset` | `integer` | (Optional) Writes the time into the structure `setpoint_time_plc_symbol` names, at this byte offset. |
 
 ### 2. Interface Parameters
 For each `<state_interface>` and `<command_interface>`, you must provide parameters that link it to a PLC variable.
@@ -46,6 +50,24 @@ For each `<state_interface>` and `<command_interface>`, you must provide paramet
 | `n_elements`    | `integer` | (Optional) The number of elements if the symbol is an array. Defaults to 1. |
 | `index`         | `integer` | (Optional) The index within the PLC array that this interface corresponds to. Defaults to 0. |
 | `initial_value` | `double`  | (Optional, Command Only) The initial value for a command interface before the first command is received. |
+| `byte_offset`   | `integer` | (Optional) Maps the interface to the field at this byte offset of a PLC structure. Not combined with `n_elements` or `index`. |
+| `byte_size`     | `integer` | (Optional) Size of that structure in bytes. Required on at least one interface of the structure. |
+| `seed_from_state` | `string` | (Optional, Command Only) State interface whose value the command takes on every activation. Not combined with `initial_value`. |
+
+### PLC Structures
+Interfaces with `byte_offset` on the same `PLC_symbol` read or write that structure in one transfer, each field with its own `PLC_type`. Declare the structure `{attribute 'pack_mode' := '1'}` on the PLC so the offsets match. Configure fails when fields overlap or run past `byte_size`, or when `byte_size` differs from the structure's size on the PLC. Unmapped bytes are written as zero.
+
+A written structure is sent once every field has a value. Seed position commands with `seed_from_state` so the structure is sent from activation.
+
+```xml
+<command_interface name="position">
+  <param name="PLC_symbol">GVL.stCommand</param>
+  <param name="PLC_type">LREAL</param>
+  <param name="byte_offset">16</param>
+  <param name="byte_size">66</param>
+  <param name="seed_from_state">x_axis_joint/position</param>
+</command_interface>
+```
 
 ### Supported PLC Types
 The following PLC data types are supported and are automatically converted to and from `double` values.
@@ -139,9 +161,6 @@ The ADS protocol supports asynchronous callbacks, where the PLC can push a varia
 
 ### Support for STRING Data Type
 We plan to add support for reading PLC `STRING` variables. As `ros2_control` state interfaces are numeric, this would likely be exposed through a separate mechanism, such as publishing to a ROS topic, for monitoring purposes.
-
-### Handle Custom ADS Data Structures
-We may investigate adding support for reading and writing to user-defined structures (DUTs) on the PLC. This would allow for more complex data to be exchanged in a single, structured block. However, this is a complex feature and is considered a low-priority research item.
 
 ## License
 

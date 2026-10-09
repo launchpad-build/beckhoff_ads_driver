@@ -1,0 +1,1 @@
+A `seed_from_state` command interface parameter fills the command from a state interface on every activation, so a written structure holding a position command is sent before a controller commands it.

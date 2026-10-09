@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <stdexcept>
 
 namespace beckhoff_ads_hardware_interface
@@ -41,6 +42,66 @@ namespace utilities
     catch (const std::exception &ex)
     {
       result.error = ex.what();
+    }
+    return result;
+  }
+
+  ByteCountParseResult parseByteCount(const std::string &text)
+  {
+    ByteCountParseResult result;
+    if (text.empty() || !std::all_of(text.begin(), text.end(), [](unsigned char c)
+                                     { return std::isdigit(c) != 0; }))
+    {
+      result.error = "not a non-negative whole number";
+    }
+    else
+    {
+      try
+      {
+        result.value = static_cast<size_t>(std::stoull(text));
+        result.valid = true;
+      }
+      catch (const std::exception &ex)
+      {
+        result.error = ex.what();
+      }
+    }
+    return result;
+  }
+
+  std::string validateStructFields(size_t byte_size, std::vector<StructFieldSpan> fields)
+  {
+    std::string error;
+    std::sort(fields.begin(), fields.end(), [](const StructFieldSpan &a, const StructFieldSpan &b)
+              { return a.offset < b.offset; });
+    for (size_t i = 0; i < fields.size() && error.empty(); ++i)
+    {
+      const StructFieldSpan &field = fields[i];
+      if (field.size == 0 || field.offset > byte_size || field.size > byte_size - field.offset)
+      {
+        error = "field '" + field.name + "' at byte " + std::to_string(field.offset) + " (" +
+                std::to_string(field.size) + " bytes) does not fit in " + std::to_string(byte_size) + " bytes";
+      }
+      else if (i + 1 < fields.size() && fields[i + 1].offset < field.offset + field.size)
+      {
+        error = "fields '" + field.name + "' and '" + fields[i + 1].name + "' overlap at byte " +
+                std::to_string(fields[i + 1].offset);
+      }
+    }
+    return error;
+  }
+
+  std::optional<uint32_t> symbolSizeFromEntry(const std::vector<uint8_t> &entry, size_t bytes_read)
+  {
+    // AdsSymbolEntry: entryLength, iGroup, iOffs, size, dataType, flags (uint32 each), then three uint16 lengths.
+    constexpr size_t SIZE_OFFSET = 12;
+    constexpr size_t HEADER_SIZE = 6 * sizeof(uint32_t) + 3 * sizeof(uint16_t);
+    std::optional<uint32_t> result;
+    if (bytes_read >= HEADER_SIZE && entry.size() >= HEADER_SIZE)
+    {
+      uint32_t size = 0;
+      std::memcpy(&size, entry.data() + SIZE_OFFSET, sizeof(size));
+      result = size;
     }
     return result;
   }

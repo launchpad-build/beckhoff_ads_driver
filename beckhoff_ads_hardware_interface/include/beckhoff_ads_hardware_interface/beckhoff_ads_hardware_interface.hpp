@@ -93,7 +93,20 @@ namespace beckhoff_ads_hardware_interface
     size_t offset_in_write_request_data; // Byte offset where this item's data starts.
 
     // For interfaces targeting the same PLC symbol, store all their names with their corresponding index inside a map. This will be useful when calling thr ROS2 set_state and set_command functions.
+    // Keyed by array index, or by byte offset in a structured layout.
     std::map<size_t, std::string> ros2_interfaces_;
+
+    // A structured layout maps its interfaces to fields of a PLC structure by byte_offset, each with its own type.
+    bool structured = false;
+    size_t struct_byte_size = 0;
+    std::map<std::string, PLCType> field_types_; // structured only, keyed by interface name
+
+    size_t item_byte_size() const { return structured ? struct_byte_size : plc_element_byte_size * num_elements; }
+    size_t field_byte_offset(size_t key) const { return structured ? key : key * plc_element_byte_size; }
+    PLCType field_type(const std::string &interface_name) const
+    {
+      return structured ? field_types_.at(interface_name) : plc_type;
+    }
 
     std::map<std::string, CommandFallback> fallback_policies_;
 
@@ -136,6 +149,8 @@ namespace beckhoff_ads_hardware_interface
     // An unseeded field keeps its whole item out of the transmitted request.
     bool seeded = false;
     size_t layout_index = 0; // index of the owning layout in ads_item_layouts_write_
+    // Read instruction whose value fills this command on activation (seed_from_state).
+    std::optional<size_t> seed_read_index;
     // Resolved once at configure so write() stays non-blocking. Null for the synthetic sources.
     hardware_interface::CommandInterface::SharedPtr command_handle;
     hardware_interface::StateInterface::SharedPtr fallback_state_handle;
@@ -264,6 +279,17 @@ namespace beckhoff_ads_hardware_interface
     void append_synthetic_write_layout(
         const std::string &plc_symbol, PLCType plc_type, const char *interface_name);
 
+    /**
+     * @brief Places a synthetic write value in its own layout, or in a structure field when its offset parameter is set
+     *
+     * @param plc_symbol The PLC symbol the value targets
+     * @param offset_parameter The hardware parameter naming the byte offset inside that symbol's structure
+     * @param plc_type The PLC type of the value
+     * @param interface_name The synthetic interface name tagging the instruction
+     */
+    void add_synthetic_write_value(const std::string &plc_symbol, const char *offset_parameter,
+                                   PLCType plc_type, const char *interface_name);
+
     std::string heartbeat_symbol_;        // PLC symbol to beat on; empty disables the heartbeat
     uint32_t heartbeat_counter_{0};       // advanced in write(), so control-loop thread only
 
@@ -335,6 +361,57 @@ namespace beckhoff_ads_hardware_interface
     std::vector<ADSDataLayout> ads_item_layouts_write_;
     void ads_read_layout_configure();
     void ads_write_layout_configure();
+
+    /**
+     * @brief Adds an interface declaring byte_offset as a field of its symbol's structured layout
+     *
+     * @param layouts The read or write layouts
+     * @param interface_name The full interface name
+     * @param description The interface description holding the PLC parameters
+     * @param interface_optional True when the interface declared optional="true"
+     * @returns The index of the layout the field joined, or nothing when the field was rejected into layout_errors_
+     */
+    std::optional<size_t> add_struct_field(std::vector<ADSDataLayout> &layouts, const std::string &interface_name,
+                                    const hardware_interface::InterfaceDescription &description,
+                                    bool interface_optional);
+
+    /**
+     * @brief Records an error for every structured layout whose fields do not fit its byte_size
+     *
+     * @param layouts The read or write layouts
+     * @param direction "read" or "write", for the error text
+     */
+    void validate_struct_layouts(const std::vector<ADSDataLayout> &layouts, const char *direction);
+
+    std::vector<std::string> layout_errors_; // filled while configuring the layouts; any entry fails configure
+
+    // Command interface -> the state interface whose value seeds it on activation (seed_from_state).
+    std::map<std::string, std::string> seed_from_state_;
+
+    /**
+     * @brief Records a command interface's seed_from_state parameter, or an error for an unusable one
+     *
+     * @param interface_name The command interface
+     * @param description The interface description holding the parameters
+     */
+    void register_seed_from_state(const std::string &interface_name,
+                                  const hardware_interface::InterfaceDescription &description);
+
+    /**
+     * @brief Fills every seeded command's slot in the write buffer from the latest read sample
+     *
+     * @returns False when a seeding state has no finite value
+     */
+    bool seed_commands_from_state();
+
+    /**
+     * @brief Compares a structured layout's byte_size with the symbol's size on the PLC
+     *
+     * @param layout The structured layout, its symbol already resolved
+     * @param device The ADS device that resolved it
+     * @returns An error description, or empty when the sizes match
+     */
+    std::string check_struct_size(const ADSDataLayout &layout, const AdsDevice &device) const;
     bool build_sum_read_buffers();
     bool build_sum_write_buffers();
 

@@ -82,6 +82,20 @@ if(BUILD_TESTING)
     test/test_latest_sample_buffer.cpp
   )
   target_link_libraries(test_latest_sample_buffer beckhoff_ads_hardware_interface)
+
+  ament_add_gtest(test_legacy_symbol_layout
+    test/test_legacy_symbol_layout.cpp
+    test/fake_ads_server.cpp
+    TIMEOUT 120
+  )
+  target_link_libraries(test_legacy_symbol_layout beckhoff_ads_hardware_interface)
+
+  ament_add_gtest(test_struct_symbol_layout
+    test/test_struct_symbol_layout.cpp
+    test/fake_ads_server.cpp
+    TIMEOUT 120
+  )
+  target_link_libraries(test_struct_symbol_layout beckhoff_ads_hardware_interface)
 endif()
 
 ament_package()
