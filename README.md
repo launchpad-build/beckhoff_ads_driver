@@ -4,7 +4,7 @@ Author: Nikola Banovic Contributor: Hajar Bartakh
 
 This package provides a `ros2_control` **SystemInterface** for communicating with Beckhoff TwinCAT PLCs. It acts as a transport layer, allowing `ros2_control` controllers to read from and write to PLC variables (e.g., joint states, GPIOs, sensor values) over the network.
 
-The core of this hardware interface is in using **ADS Sum-Commands**. This allows us to read/write multiple PLC variables in a single network transaction, bringing the total network transactions per update loop to only 2 (one **read** and one **write**).
+The hardware interface uses **ADS Sum-Commands** to batch PLC variables. One background I/O worker performs paced reads and queued writes, keeping network transactions off the control loop.
 
 This package is built upon the [official `beckhoff/ADS` library](https://github.com/Beckhoff/ADS), which handles the low-level ADS protocol communication.
 
@@ -46,6 +46,9 @@ For each `<state_interface>` and `<command_interface>`, you must provide paramet
 | `n_elements`    | `integer` | (Optional) The number of elements if the symbol is an array. Defaults to 1. |
 | `index`         | `integer` | (Optional) The index within the PLC array that this interface corresponds to. Defaults to 0. |
 | `initial_value` | `double`  | (Optional, Command Only) The initial value for a command interface before the first command is received. |
+| `command_fallback` | `string` | (Optional, Command Only) `hold_last`, `mirror_state`, `zero`, or `none`. Defaults to `hold_last`, except joint velocity defaults to `zero`. |
+
+Use `none` for commands that the PLC consumes once. Empty control cycles do not resend them, and an uncertain write result stays faulted even with `outage_behaviour=resume`. Partial array writes require matching state readback to preserve untouched elements. Duplicate command owners for one PLC element and sparse mappings without readback are rejected.
 
 ### Supported PLC Types
 The following PLC data types are supported and are automatically converted to and from `double` values.

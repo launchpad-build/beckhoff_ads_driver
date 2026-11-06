@@ -1,0 +1,1 @@
+Use one ADS I/O owner and preserve queued explicit commands across empty cycles. The command_fallback=none policy avoids replay, while partial arrays preserve fresh PLC readback and stale responses or uncertain pulse writes require recovery. Serialize xacro critical and optional flags as lowercase booleans so the driver honors them.

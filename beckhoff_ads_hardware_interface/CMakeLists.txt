@@ -68,6 +68,10 @@ ament_export_dependencies(
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(gpio_controllers REQUIRED)
+  ament_add_gtest(test_command_readback test/test_command_readback.cpp TIMEOUT 30)
+  target_link_libraries(test_command_readback beckhoff_ads_hardware_interface)
+  ament_target_dependencies(test_command_readback gpio_controllers)
   ament_add_gtest(test_ads_interface_utilities
     test/test_ads_interface_utilities.cpp
   )

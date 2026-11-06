@@ -16,7 +16,7 @@
                 <param name="command_fallback">${command_fallback}</param>
             </xacro:if>
             <xacro:if value="${optional != ''}">
-                <param name="optional">${optional}</param>
+                <param name="optional">${str(optional).lower()}</param>
             </xacro:if>
         </command_interface>
     </xacro:macro>
@@ -30,10 +30,10 @@
                 <param name="index">${index}</param>
             </xacro:if>
             <xacro:if value="${optional != ''}">
-                <param name="optional">${optional}</param>
+                <param name="optional">${str(optional).lower()}</param>
             </xacro:if>
             <xacro:if value="${critical != ''}">
-                <param name="critical">${critical}</param>
+                <param name="critical">${str(critical).lower()}</param>
             </xacro:if>
         </state_interface>
     </xacro:macro>

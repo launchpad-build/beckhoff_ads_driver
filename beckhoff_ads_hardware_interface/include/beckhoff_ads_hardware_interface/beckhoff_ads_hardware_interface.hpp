@@ -59,6 +59,7 @@ namespace beckhoff_ads_hardware_interface
     HOLD_LAST,    // keep whatever was packed on the last cycle that carried a command
     MIRROR_STATE, // send the state interface sharing this PLC symbol, so the target tracks reality
     ZERO,         // send zero; the right answer for a velocity or effort command
+    NONE,         // send only explicitly provided values
   };
 
   enum class WriteValueSource
@@ -91,9 +92,11 @@ namespace beckhoff_ads_hardware_interface
 
     // for packing sum write response [ADS_ITEM_REQ_HEADER_1,...,ADS_ITEM_REQ_HEADER_N | Data1_bytes,...,DataN_bytes]
     size_t offset_in_write_request_data; // Byte offset where this item's data starts.
+    std::optional<size_t> readback_data_offset;
+    std::optional<size_t> readback_error_offset;
 
     // For interfaces targeting the same PLC symbol, store all their names with their corresponding index inside a map. This will be useful when calling thr ROS2 set_state and set_command functions.
-    std::map<size_t, std::string> ros2_interfaces_;
+    std::multimap<size_t, std::string> ros2_interfaces_;
 
     std::map<std::string, CommandFallback> fallback_policies_;
 
@@ -133,8 +136,7 @@ namespace beckhoff_ads_hardware_interface
     CommandFallback fallback = CommandFallback::HOLD_LAST;
     WriteValueSource source = WriteValueSource::CONTROLLER;
     bool has_been_commanded = false;
-    // An unseeded field keeps its whole item out of the transmitted request.
-    bool seeded = false;
+    double last_value = std::numeric_limits<double>::quiet_NaN();
     size_t layout_index = 0; // index of the owning layout in ads_item_layouts_write_
     // Resolved once at configure so write() stays non-blocking. Null for the synthetic sources.
     hardware_interface::CommandInterface::SharedPtr command_handle;
@@ -149,19 +151,17 @@ namespace beckhoff_ads_hardware_interface
     uint64_t sequence = 0; // 0 means no sample has been published yet
   };
 
-  // The latest packed sum-write request handed from write() to the writer thread.
+  // Values awaiting the I/O owner. NaN means this field has no pending command.
   struct PendingWrite
   {
-    std::vector<uint8_t> buffer;
-    std::vector<size_t> layout_indices; // original layout index of each item in the buffer
-    size_t num_items = 0;
+    std::vector<double> values;
     std::chrono::steady_clock::time_point handoff_stamp{};
   };
 
   class BeckhoffADSHardwareInterface : public hardware_interface::SystemInterface
   {
   public:
-    ~BeckhoffADSHardwareInterface() override; // joins the I/O threads if a lifecycle shutdown did not
+    ~BeckhoffADSHardwareInterface() override; // joins the I/O owner if a lifecycle shutdown did not
 
     hardware_interface::CallbackReturn on_init(const hardware_interface::HardwareComponentInterfaceParams &params) override;
 
@@ -202,7 +202,7 @@ namespace beckhoff_ads_hardware_interface
     /**
      * @brief Parses a command_fallback interface parameter into its enum
      *
-     * @param policy_str Parameter text: hold_last, mirror_state or zero
+     * @param policy_str Parameter text: none, hold_last, mirror_state or zero
      * @param interface_name Interface the parameter belongs to, for the warning on a bad value
      * @returns The matching policy, or HOLD_LAST when the text is empty or unrecognised
      */
@@ -227,7 +227,7 @@ namespace beckhoff_ads_hardware_interface
      * @brief Records a failed SUM-read round-trip for outage and recovery logs
      *
      * Stamps the outage start on the first failure and resets recovery tracking.
-     * Reader thread only.
+     * I/O owner only.
      */
     void record_read_failure();
 
@@ -235,7 +235,7 @@ namespace beckhoff_ads_hardware_interface
      * @brief Records a failed SUM-write round-trip for outage and recovery logs
      *
      * Stamps the outage start on the first failure and resets recovery tracking.
-     * Writer thread only.
+     * I/O owner only.
      */
     void record_write_failure();
 
@@ -300,13 +300,11 @@ namespace beckhoff_ads_hardware_interface
     size_t plcTypeByteSize(PLCType type_enum);
 
     // ADS Communication objects
-    // Reset or replace only after stop_io_threads() has joined both I/O threads.
-    // Two local AMS ports on one net id, so the reader and writer never contend for a port.
-    std::unique_ptr<AdsDevice> ads_read_device_;  // owned by the reader thread's round-trips
-    std::unique_ptr<AdsDevice> ads_write_device_; // owned by the writer thread's round-trips
+    // Reset or replace only after stop_io() has joined the I/O owner.
+    std::unique_ptr<AdsDevice> ads_device_;
     bool configure_ads_device();
 
-    // Joins the I/O threads, releases the handles and drops the devices, in that order.
+    // Joins the I/O owner, releases its handles and drops the device, in that order.
     void teardown_ads_device();
 
     // Releases every cached PLC symbol handle (ADSDataLayout::ads_handle_owner). Each handle's
@@ -333,8 +331,8 @@ namespace beckhoff_ads_hardware_interface
     // Describes each variable on the PLC
     std::vector<ADSDataLayout> ads_item_layouts_read_;
     std::vector<ADSDataLayout> ads_item_layouts_write_;
-    void ads_read_layout_configure();
-    void ads_write_layout_configure();
+    bool ads_read_layout_configure();
+    bool ads_write_layout_configure();
     bool build_sum_read_buffers();
     bool build_sum_write_buffers();
 
@@ -351,15 +349,16 @@ namespace beckhoff_ads_hardware_interface
     std::vector<uint8_t> ads_buffer_sum_write_response_;
     size_t num_items_write_ = 0;
 
-    // Owned by the control loop; the writer thread only sees the handed-over PendingWrite.
+    // The I/O owner packs only the fields received from the control loop.
     std::vector<utilities::SumWriteItemSpan> write_item_spans_;
-    std::vector<size_t> identity_layout_indices_;
-    std::vector<uint8_t> write_layout_seeded_;
+    std::vector<uint8_t> write_layout_dirty_;
+    std::vector<size_t> write_layout_provided_count_;
+    std::vector<double> write_values_;
     std::vector<uint8_t> ads_buffer_sum_write_compact_;
     std::vector<size_t> compact_layout_indices_;
 
     /**
-     * @brief Copies the I/O threads' counters into the introspected mirrors
+     * @brief Copies the I/O owner's counters into the introspected mirrors
      */
     void refresh_transaction_statistics();
 
@@ -406,53 +405,38 @@ namespace beckhoff_ads_hardware_interface
     std::vector<ReadInstruction> ads_read_instructions_;
     std::vector<WriteInstruction> ads_write_instructions_;
 
-    // ===== Background ADS I/O threads ==========================================
-    // The blocking ADS SUM read/write round-trips are moved off the control loop.
-    // read()/write() only touch lock-free caches and a coalescing buffer, so the
-    // control-loop cycle time no longer depends on PLC/network latency.
+    // One owner performs every ADS transaction. The control loop only exchanges values.
+    void start_io();
+    void stop_io();
+    void io_loop();
+    bool read_plc();
+    bool write_plc(const PendingWrite &request, bool read_fresh);
 
-    void start_io_threads(); // spawns the writer and reader threads
-    void stop_io_threads();  // signals and joins both worker threads; safe to call when idle
-
-    /**
-     * @brief Applies the configured scheduling policy, priority and affinity to a thread
-     *
-     * @param thread The I/O thread to reschedule
-     * @param thread_name Human-readable thread name for the log messages
-     */
     void apply_io_thread_scheduling(std::thread &thread, const char *thread_name);
-
-    // Overridable via the io_thread_scheduling_policy, io_thread_priority and io_thread_cpu_affinity parameters.
     utilities::ThreadSchedulingConfig io_thread_scheduling_;
 
-    // Writer thread: owns the SUM-write round-trip. write() marshals the latest command
-    // buffer, hands it over here, and returns. Only the newest buffer is sent (coalescing).
-    void writer_loop();
-    std::thread write_thread_;
+    std::thread io_thread_;
     std::mutex write_mutex_;
     std::condition_variable write_cv_;
-    PendingWrite write_pending_request_; // latest packed SUM-write request awaiting send
-    bool write_pending_ = false;                 // a fresh buffer is waiting (guarded by write_mutex_)
-    bool write_stop_ = false;                     // stop request (guarded by write_mutex_)
+    PendingWrite write_pending_request_;
+    bool write_pending_ = false; // guarded by write_mutex_
+    std::atomic<bool> io_stop_{true};
+    bool has_activated_ = false;
+    std::chrono::steady_clock::time_point next_read_time_{}; // I/O owner only
+    std::chrono::steady_clock::time_point last_read_sample_time_{}; // I/O owner only
     std::atomic<bool> write_hard_fault_{false};   // outage outlived the grace window, surfaced by write()
-    // Consecutive failed SUM-write round-trips, for outage and recovery logs. Writer thread only.
+    // Consecutive failed SUM-write round-trips, for outage and recovery logs. I/O owner only.
     size_t write_consecutive_failures_ = 0;
     std::chrono::steady_clock::time_point write_outage_start_;
-    std::optional<std::chrono::steady_clock::time_point> write_recovery_stable_since_;
 
-    // Reader thread: owns the SUM-read round-trip. Decodes each sample into
-    // polling_read_cache_; read() loads from it without blocking.
-    void reader_loop();
-    std::thread read_thread_;
-    std::atomic<bool> read_stop_{false};
     std::atomic<bool> read_hard_fault_{false};      // outage outlived the grace window, surfaced by read()
     utilities::LatestSampleBuffer<ReadSample> read_sample_buffer_;
-    std::vector<double> last_decoded_values_; // reader thread only
-    uint64_t read_sample_sequence_ = 0;       // reader thread only
-    // When each item's current per-item failure streak began; reader thread only.
+    std::vector<double> last_decoded_values_; // I/O owner only
+    uint64_t read_sample_sequence_ = 0;       // I/O owner only
+    // When each item's current per-item failure streak began; I/O owner only.
     std::vector<std::optional<std::chrono::steady_clock::time_point>> item_failure_start_;
     long long read_poll_period_ns_ = 0;             // optional pacing between SUM reads; 0 = unpaced
-    // Consecutive failed SUM-read round-trips, for outage and recovery logs. Reader thread only.
+    // Consecutive failed SUM-read round-trips, for outage and recovery logs. I/O owner only.
     size_t read_consecutive_failures_ = 0;
     std::chrono::steady_clock::time_point read_outage_start_;
     std::optional<std::chrono::steady_clock::time_point> read_recovery_stable_since_;
