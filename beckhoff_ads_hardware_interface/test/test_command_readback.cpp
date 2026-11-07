@@ -427,6 +427,38 @@ TEST(CommandReadback, PlcUpdatesReplacePreviousCommandsAcrossConfigureCycles)
   }
   EXPECT_EQ(driver.on_shutdown(state), hardware_interface::CallbackReturn::SUCCESS);
 
+  const auto await = [](const auto &ready) {
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (!ready() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
+    return ready();
+  };
+
+  // A fresh process must preserve a held level until a caller explicitly changes it.
+  plc.scalar.store(1);
+  const auto before_cold_start = plc.writes.load();
+  beckhoff_ads_hardware_interface::BeckhoffADSHardwareInterface cold_driver;
+  ASSERT_EQ(cold_driver.init(params), hardware_interface::CallbackReturn::SUCCESS);
+  cold_driver.on_export_state_interfaces();
+  cold_driver.on_export_command_interfaces();
+  ASSERT_EQ(cold_driver.on_configure(state), hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(cold_driver.on_activate(state), hardware_interface::CallbackReturn::SUCCESS);
+  const auto cold_reads = plc.read_requests.load();
+  ASSERT_TRUE(await([&] {
+    EXPECT_EQ(cold_driver.write(params.clock->now(), period), hardware_interface::return_type::OK);
+    return plc.read_requests.load() >= cold_reads + 3;
+  }));
+  EXPECT_EQ(plc.writes.load(), before_cold_start);
+  EXPECT_EQ(plc.scalar.load(), 1);
+  cold_driver.set_command("io/unpaired", 4.0);
+  ASSERT_EQ(cold_driver.write(params.clock->now(), period), hardware_interface::return_type::OK);
+  ASSERT_TRUE(await([&] { return plc.writes.load() == before_cold_start + 1; }));
+  EXPECT_EQ(plc.scalar.load(), 1);
+  cold_driver.set_command("io/scalar", 0.0);
+  ASSERT_EQ(cold_driver.write(params.clock->now(), period), hardware_interface::return_type::OK);
+  ASSERT_TRUE(await([&] { return plc.writes.load() == before_cold_start + 2; }));
+  EXPECT_EQ(plc.scalar.load(), 0);
+  ASSERT_EQ(cold_driver.on_shutdown(state), hardware_interface::CallbackReturn::SUCCESS);
+
   // Optional stream metadata must remain together through the new command queue.
   auto &settings = params.hardware_info.hardware_parameters;
   settings["heartbeat_plc_symbol"] = "BENCH.heartbeat";
@@ -440,11 +472,6 @@ TEST(CommandReadback, PlcUpdatesReplacePreviousCommandsAcrossConfigureCycles)
   metadata_driver.on_export_command_interfaces();
   ASSERT_EQ(metadata_driver.on_configure(state), hardware_interface::CallbackReturn::SUCCESS);
   ASSERT_EQ(metadata_driver.on_activate(state), hardware_interface::CallbackReturn::SUCCESS);
-  const auto await = [](const auto &ready) {
-    const auto deadline = std::chrono::steady_clock::now() + 2s;
-    while (!ready() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
-    return ready();
-  };
   for (unsigned update = 1; update <= 2; ++update) {
     metadata_driver.set_command("io/scalar", static_cast<double>(update));
     ASSERT_EQ(metadata_driver.write(params.clock->now(), period), hardware_interface::return_type::OK);
