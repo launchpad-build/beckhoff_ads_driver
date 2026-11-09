@@ -54,7 +54,13 @@ public:
 
   std::array<std::atomic<uint8_t>, 3> value{};
   std::atomic<uint8_t> scalar{77};
-  std::atomic<bool> clear_scalar_after_read{false};
+  // Only this peer models PLC event admission. Raw command storage stays ROS-owned.
+  std::array<std::atomic<uint32_t>, 4> boot_id{{1, 17, 23, 29}};
+  std::array<std::atomic<uint32_t>, 4> boot_echo{};
+  std::atomic<bool> scan_enabled{true};
+  std::atomic<bool> input_ready{false};
+  std::atomic<uint8_t> observed_event{0};
+  std::atomic<uint32_t> accepted_events{0};
   std::atomic<unsigned> writes{0};
   std::atomic<bool> hold_writes{false};
   std::atomic<bool> hold_reads{false};
@@ -67,6 +73,26 @@ public:
   std::atomic<uint8_t> metadata_scalar{0};
 
 private:
+  void scan()
+  {
+    if (scanned_boot_ != boot_id[0].load()) {
+      scanned_boot_ = boot_id[0].load();
+      input_ready.store(false);
+      previous_event_ = false;
+    }
+    if (!scan_enabled.load()) return;
+    bool current_boot = true;
+    for (size_t i = 0; i < boot_id.size(); ++i) {
+      current_boot = current_boot && boot_echo[i].load() == boot_id[i].load();
+    }
+    const bool event = scalar.load() != 0;
+    if (!current_boot) input_ready.store(false);
+    else if (!event) input_ready.store(true);
+    if (input_ready.load() && event && !previous_event_) ++accepted_events;
+    previous_event_ = event;
+    observed_event.store(event);
+  }
+
   static uint32_t number(const std::vector<uint8_t> &data, size_t offset)
   {
     uint32_t result;
@@ -113,7 +139,12 @@ private:
           if (group == 0xF003) {
             append(response, 4);
             const std::string symbol(reinterpret_cast<const char *>(request.data() + 48), request.size() - 48);
-            const uint32_t handle = symbol.find("heartbeat") != std::string::npos ? 3 :
+            const uint32_t handle = symbol.find("boot_id") != std::string::npos ? 6 :
+              symbol.find("boot_echo") != std::string::npos ? 7 :
+              symbol.find("observed_event") != std::string::npos ? 8 :
+              symbol.find("accepted_events") != std::string::npos ? 9 :
+              symbol.find("input_ready") != std::string::npos ? 10 :
+              symbol.find("heartbeat") != std::string::npos ? 3 :
               symbol.find("sequence") != std::string::npos ? 4 :
               symbol.find("timestamp") != std::string::npos ? 5 :
               symbol.find("other") != std::string::npos ? 2 : 1;
@@ -121,6 +152,7 @@ private:
           } else if (group == 0xF080) {
             ++read_requests;
             while (hold_reads.load() && !stopping_.load()) std::this_thread::sleep_for(1ms);
+            scan();
             const uint32_t count = number(request, 36);
             uint32_t size = 4 * count;
             for (uint32_t i = 0; i < count; ++i) size += number(request, 56 + 12 * i);
@@ -134,11 +166,18 @@ private:
                 for (size_t k = 0; k < value.size(); ++k) {
                   response.push_back(failing && k == 2 ? 199 : value[k].load());
                 }
+              } else if (number(request, 52 + 12 * i) == 6) {
+                for (const auto &word : boot_id) append(response, word.load());
+              } else if (number(request, 52 + 12 * i) == 8) {
+                response.push_back(observed_event.load());
+              } else if (number(request, 52 + 12 * i) == 9) {
+                append(response, accepted_events.load());
+              } else if (number(request, 52 + 12 * i) == 10) {
+                response.push_back(input_ready.load());
               } else {
                 response.push_back(failing ? 88 : scalar.load());
               }
             }
-            if (clear_scalar_after_read.exchange(false)) scalar.store(0);
           } else if (group == 0xF081) {
             const uint32_t count = number(request, 36);
             size_t data = 48 + count * 12;
@@ -162,6 +201,10 @@ private:
                 double stamp;
                 std::memcpy(&stamp, request.data() + data, sizeof(stamp));
                 timestamp.store(stamp); metadata |= 4;
+              } else if (handle == 7) {
+                for (size_t k = 0; k < boot_echo.size(); ++k) {
+                  boot_echo[k].store(number(request, data + k * sizeof(uint32_t)));
+                }
               }
               data += size;
             }
@@ -197,9 +240,11 @@ private:
   std::atomic<int> client_{-1};
   std::atomic<bool> stopping_{false};
   std::thread thread_;
+  uint32_t scanned_boot_{0};
+  bool previous_event_{false};
 };
 
-TEST(CommandReadback, PlcUpdatesReplacePreviousCommandsAcrossConfigureCycles)
+TEST(CommandReadback, StockReplayPreservesRawCommandsAndRequiresPlcEventAdmission)
 {
   rclcpp::init(0, nullptr);
   LoopbackPlc plc;
@@ -221,9 +266,20 @@ TEST(CommandReadback, PlcUpdatesReplacePreviousCommandsAcrossConfigureCycles)
           <command_interface name="unpaired"><param name="PLC_symbol">MAIN.commands</param><param name="PLC_type">USINT</param><param name="n_elements">3</param><param name="index">0</param><param name="command_fallback">none</param></command_interface>
           <command_interface name="paired"><param name="PLC_symbol">MAIN.commands</param><param name="PLC_type">USINT</param><param name="n_elements">3</param><param name="index">2</param><param name="command_fallback">none</param></command_interface>
           <command_interface name="scalar"><param name="PLC_symbol">MAIN.other</param><param name="PLC_type">USINT</param><param name="command_fallback">none</param></command_interface>
+          <command_interface name="boot_echo_0"><param name="PLC_symbol">MAIN.boot_echo</param><param name="PLC_type">UDINT</param><param name="n_elements">4</param><param name="index">0</param><param name="command_fallback">none</param></command_interface>
+          <command_interface name="boot_echo_1"><param name="PLC_symbol">MAIN.boot_echo</param><param name="PLC_type">UDINT</param><param name="n_elements">4</param><param name="index">1</param><param name="command_fallback">none</param></command_interface>
+          <command_interface name="boot_echo_2"><param name="PLC_symbol">MAIN.boot_echo</param><param name="PLC_type">UDINT</param><param name="n_elements">4</param><param name="index">2</param><param name="command_fallback">none</param></command_interface>
+          <command_interface name="boot_echo_3"><param name="PLC_symbol">MAIN.boot_echo</param><param name="PLC_type">UDINT</param><param name="n_elements">4</param><param name="index">3</param><param name="command_fallback">none</param></command_interface>
           <state_interface name="readback"><param name="PLC_symbol">MAIN.commands</param><param name="PLC_type">USINT</param><param name="n_elements">3</param><param name="index">2</param><param name="critical">true</param></state_interface>
           <state_interface name="readback_alias"><param name="PLC_symbol">MAIN.commands</param><param name="PLC_type">USINT</param><param name="n_elements">3</param><param name="index">2</param><param name="critical">true</param></state_interface>
           <state_interface name="other"><param name="PLC_symbol">MAIN.other</param><param name="PLC_type">USINT</param><param name="critical">true</param></state_interface>
+          <state_interface name="boot_id_0"><param name="PLC_symbol">MAIN.boot_id</param><param name="PLC_type">UDINT</param><param name="n_elements">4</param><param name="index">0</param><param name="critical">true</param></state_interface>
+          <state_interface name="boot_id_1"><param name="PLC_symbol">MAIN.boot_id</param><param name="PLC_type">UDINT</param><param name="n_elements">4</param><param name="index">1</param><param name="critical">true</param></state_interface>
+          <state_interface name="boot_id_2"><param name="PLC_symbol">MAIN.boot_id</param><param name="PLC_type">UDINT</param><param name="n_elements">4</param><param name="index">2</param><param name="critical">true</param></state_interface>
+          <state_interface name="boot_id_3"><param name="PLC_symbol">MAIN.boot_id</param><param name="PLC_type">UDINT</param><param name="n_elements">4</param><param name="index">3</param><param name="critical">true</param></state_interface>
+          <state_interface name="observed_event"><param name="PLC_symbol">MAIN.observed_event</param><param name="PLC_type">USINT</param><param name="critical">true</param></state_interface>
+          <state_interface name="accepted_events"><param name="PLC_symbol">MAIN.accepted_events</param><param name="PLC_type">UDINT</param><param name="critical">true</param></state_interface>
+          <state_interface name="input_ready"><param name="PLC_symbol">MAIN.input_ready</param><param name="PLC_type">USINT</param><param name="critical">true</param></state_interface>
         </gpio>
       </ros2_control>
     </robot>)";
@@ -241,9 +297,9 @@ TEST(CommandReadback, PlcUpdatesReplacePreviousCommandsAcrossConfigureCycles)
   controller_params.robot_description = description;
   controller_params.node_options.parameter_overrides({
     {"gpios", std::vector<std::string>{"io"}},
-    {"command_interfaces.io.interfaces", std::vector<std::string>{"unpaired", "paired", "scalar"}},
-    {"state_interfaces.io.interfaces", std::vector<std::string>{"readback", "other"}},
-    {"consume_commands_once", true}});
+    {"command_interfaces.io.interfaces", std::vector<std::string>{
+      "unpaired", "paired", "scalar", "boot_echo_0", "boot_echo_1", "boot_echo_2", "boot_echo_3"}},
+    {"state_interfaces.io.interfaces", std::vector<std::string>{"readback", "other"}}});
   ASSERT_EQ(controller.init(controller_params), controller_interface::return_type::OK);
   ASSERT_EQ(controller.on_configure(state), controller_interface::CallbackReturn::SUCCESS);
   std::vector<hardware_interface::LoanedCommandInterface> command_loans;
@@ -320,22 +376,62 @@ TEST(CommandReadback, PlcUpdatesReplacePreviousCommandsAcrossConfigureCycles)
       EXPECT_EQ(plc.writes.load(), initial_writes);
     }
     ASSERT_TRUE(wait([&] { return publisher->get_subscription_count() > 0; }));
-    const auto before_scalar = plc.writes.load();
-    ASSERT_TRUE(issue({"scalar"}, {1.0}));
-    tick();
-    ASSERT_TRUE(wait([&] { return plc.writes.load() > before_scalar; }));
-    plc.scalar.store(0);  // The PLC consumes its pulse independently.
-    tick();
-    for (int i = 0; i < 5; ++i) {
-      tick();
-      std::this_thread::sleep_for(2ms);
+    if (expected == 1) {
+      ASSERT_TRUE(issue({"boot_echo_0", "boot_echo_1", "boot_echo_2", "boot_echo_3", "scalar"},
+        {1.0, 17.0, 23.0, 29.0, 0.0}));
+      ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/input_ready") == 1; }));
+      for (size_t i = 0; i < plc.boot_echo.size(); ++i) {
+        EXPECT_EQ(plc.boot_echo[i].load(), plc.boot_id[i].load());
+      }
+      ASSERT_TRUE(issue({"scalar"}, {1.0}));
+      ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/accepted_events") == 1; }));
+      const auto held_writes = plc.writes.load();
+      ASSERT_TRUE(wait([&] { return plc.writes.load() >= held_writes + 3; }));
+      EXPECT_EQ(plc.scalar.load(), 1);  // Native consumption never clears raw input.
+      EXPECT_EQ(plc.accepted_events.load(), 1);  // Replayed high is still one event.
+
+      // ADS readback of zero alone does not prove the PLC sampled the low edge.
+      plc.scan_enabled.store(false);
+      ASSERT_TRUE(issue({"scalar"}, {0.0}));
+      ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/other") == 0; }));
+      EXPECT_EQ(driver.get_state<double>("io/observed_event"), 1);
+      plc.scan_enabled.store(true);
+      ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/observed_event") == 0; }));
+      ASSERT_TRUE(issue({"scalar"}, {1.0}));
+      ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/accepted_events") == 2; }));
+
+      // A new PLC identity rejects the controller's cached hazardous high.
+      plc.boot_id[0].store(2);
+      ASSERT_TRUE(wait([&] {
+        return driver.get_state<double>("io/boot_id_0") == 2 &&
+               driver.get_state<double>("io/input_ready") == 0;
+      }));
+      const auto reset_writes = plc.writes.load();
+      ASSERT_TRUE(wait([&] { return plc.writes.load() >= reset_writes + 3; }));
+      EXPECT_EQ(plc.scalar.load(), 1);
+      EXPECT_EQ(plc.accepted_events.load(), 2);
+      ASSERT_TRUE(issue({"scalar"}, {0.0}));
+      ASSERT_TRUE(wait([&] {
+        return driver.get_state<double>("io/other") == 0 &&
+               driver.get_state<double>("io/observed_event") == 0;
+      }));
+      EXPECT_EQ(driver.get_state<double>("io/input_ready"), 0);  // Old echo cannot rearm.
+      ASSERT_TRUE(issue({"boot_echo_0", "boot_echo_1", "boot_echo_2", "boot_echo_3", "scalar"},
+        {2.0, 17.0, 23.0, 29.0, 1.0}));
+      const auto relabelled_writes = plc.writes.load();
+      ASSERT_TRUE(wait([&] { return plc.writes.load() >= relabelled_writes + 3; }));
+      EXPECT_FALSE(plc.input_ready.load());
+      EXPECT_EQ(plc.accepted_events.load(), 2);
+      ASSERT_TRUE(issue({"scalar"}, {0.0}));
+      ASSERT_TRUE(wait([&] {
+        return driver.get_state<double>("io/input_ready") == 1 &&
+               driver.get_state<double>("io/observed_event") == 0;
+      }));
+      ASSERT_TRUE(issue({"scalar"}, {1.0}));
+      ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/accepted_events") == 3; }));
     }
-    EXPECT_EQ(plc.writes.load(), before_scalar + 1);
-    EXPECT_EQ(plc.scalar.load(), 0);
-    ASSERT_TRUE(issue({"scalar"}, {1.0}));
-    ASSERT_TRUE(wait([&] { return plc.writes.load() > before_scalar + 1; }));
-    EXPECT_EQ(plc.scalar.load(), 1);
-    plc.scalar.store(0);
+    ASSERT_TRUE(issue({"scalar"}, {0.0}));
+    ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/other") == 0; }));
     ASSERT_TRUE(issue({"unpaired", "paired"}, {7.0, static_cast<double>(expected)}));
     const auto before = plc.writes.load();
     plc.hold_writes.store(true);
@@ -345,12 +441,12 @@ TEST(CommandReadback, PlcUpdatesReplacePreviousCommandsAcrossConfigureCycles)
     plc.hold_writes.store(false);
     ASSERT_TRUE(received);
     ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/readback") == expected; }));
-    EXPECT_EQ(plc.writes.load(), before + 1);
+    EXPECT_GT(plc.writes.load(), before);
     EXPECT_EQ(plc.value[0].load(), 7);
     EXPECT_EQ(plc.value[1].load(), 19);
     EXPECT_EQ(plc.value[2].load(), expected);
     EXPECT_EQ(driver.get_state<double>("io/readback_alias"), expected);
-    EXPECT_EQ(plc.scalar.load(), 0);  // An unrelated write must not replay the scalar pulse.
+    EXPECT_EQ(plc.scalar.load(), 0);  // Partial messages preserve the last raw value.
 
     // A new explicit Stop survives later empty ticks while another write is in flight.
     const auto before_stop = plc.writes.load();
@@ -363,35 +459,48 @@ TEST(CommandReadback, PlcUpdatesReplacePreviousCommandsAcrossConfigureCycles)
     tick();
     plc.hold_writes.store(false);
     ASSERT_TRUE(active);
-    ASSERT_TRUE(wait([&] { return plc.writes.load() > before_stop + 1; }));
+    ASSERT_TRUE(wait([&] {
+      return plc.writes.load() > before_stop + 1 &&
+             driver.get_state<double>("io/readback") == 0;
+    }));
     EXPECT_EQ(plc.value[2].load(), 0);
 
-    plc.value[2].store(expected);  // PLC changes a latched command independently.
+    const auto before_unpaired_stream = plc.writes.load();
+    ASSERT_TRUE(issue({"unpaired"}, {8.0}));
+    ASSERT_TRUE(wait([&] {
+      return plc.writes.load() >= before_unpaired_stream + 3 && plc.value[0].load() == 8;
+    }));
+    ASSERT_EQ(controller.on_deactivate(state), controller_interface::CallbackReturn::SUCCESS);
+    const auto drain_reads = plc.read_requests.load();
+    ASSERT_TRUE(wait([&] { return plc.read_requests.load() >= drain_reads + 3; }));
+    ASSERT_EQ(controller.on_activate(state), controller_interface::CallbackReturn::SUCCESS);
+    // This field is now absent from the latest controller message.
+    plc.value[2].store(expected);
     ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/readback") == expected; }));
     const auto previous = plc.writes.load();
     const auto reading = plc.read_requests.load();
     plc.hold_reads.store(true);
     const bool awaiting_read = wait([&] { return plc.read_requests.load() > reading; });
-    plc.scalar.store(1);
-    plc.clear_scalar_after_read.store(true);
-    ASSERT_TRUE(issue({"unpaired"}, {8.0}));
+    ASSERT_TRUE(issue({"unpaired"}, {9.0}));
     tick();
     plc.hold_reads.store(false);
     ASSERT_TRUE(awaiting_read);
-    ASSERT_TRUE(wait([&] { return plc.writes.load() > previous; }));
+    ASSERT_TRUE(wait([&] { return plc.writes.load() > previous && plc.value[0].load() == 9; }));
     EXPECT_EQ(plc.value[2].load(), expected);
-    EXPECT_EQ(plc.value[0].load(), 8);
+    EXPECT_EQ(plc.value[0].load(), 9);
     EXPECT_EQ(plc.scalar.load(), 0);
 
-    const auto before_pause = plc.writes.load();
     ASSERT_TRUE(issue({"scalar"}, {9.0}));  // Received but not written before deactivation.
+    ASSERT_EQ(controller.on_deactivate(state), controller_interface::CallbackReturn::SUCCESS);
     ASSERT_EQ(driver.on_deactivate(state), hardware_interface::CallbackReturn::SUCCESS);
+    const auto before_pause = plc.writes.load();
     std::this_thread::sleep_for(550ms);
     EXPECT_EQ(driver.read(params.clock->now(), period), hardware_interface::return_type::OK);
     EXPECT_TRUE(std::isnan(driver.get_state<double>("io/readback")));
     ASSERT_TRUE(issue({"scalar"}, {8.0}));  // A value placed in the handle while hardware is inactive.
     ASSERT_EQ(driver.on_activate(state), hardware_interface::CallbackReturn::SUCCESS);
     EXPECT_TRUE(std::isnan(driver.get_command<double>("io/scalar")));
+    ASSERT_EQ(controller.on_activate(state), controller_interface::CallbackReturn::SUCCESS);
     ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/readback") == expected; }));
     for (int i = 0; i < 5; ++i) {
       tick();
