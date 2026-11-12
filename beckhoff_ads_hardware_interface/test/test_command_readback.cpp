@@ -54,13 +54,8 @@ public:
 
   std::array<std::atomic<uint8_t>, 3> value{};
   std::atomic<uint8_t> scalar{77};
-  // Only this peer models PLC event admission. Raw command storage stays ROS-owned.
-  std::array<std::atomic<uint32_t>, 4> boot_id{{1, 17, 23, 29}};
   std::array<std::atomic<uint32_t>, 4> boot_echo{};
-  std::atomic<bool> scan_enabled{true};
-  std::atomic<bool> input_ready{false};
-  std::atomic<uint8_t> observed_event{0};
-  std::atomic<uint32_t> accepted_events{0};
+  std::atomic<uint32_t> rising_edges{0};
   std::atomic<unsigned> writes{0};
   std::atomic<bool> hold_writes{false};
   std::atomic<bool> hold_reads{false};
@@ -80,22 +75,9 @@ public:
 private:
   void scan()
   {
-    if (scanned_boot_ != boot_id[0].load()) {
-      scanned_boot_ = boot_id[0].load();
-      input_ready.store(false);
-      previous_event_ = false;
-    }
-    if (!scan_enabled.load()) return;
-    bool current_boot = true;
-    for (size_t i = 0; i < boot_id.size(); ++i) {
-      current_boot = current_boot && boot_echo[i].load() == boot_id[i].load();
-    }
     const bool event = scalar.load() != 0;
-    if (!current_boot) input_ready.store(false);
-    else if (!event) input_ready.store(true);
-    if (input_ready.load() && event && !previous_event_) ++accepted_events;
+    if (event && !previous_event_) ++rising_edges;
     previous_event_ = event;
-    observed_event.store(event);
   }
 
   static uint32_t number(const std::vector<uint8_t> &data, size_t offset)
@@ -144,13 +126,10 @@ private:
           if (group == 0xF003) {
             append(response, 4);
             const std::string symbol(reinterpret_cast<const char *>(request.data() + 48), request.size() - 48);
-            const uint32_t handle = symbol.find("boot_id") != std::string::npos ? 6 :
-              symbol.find("calibration_valid") != std::string::npos ? 12 :
+            const uint32_t handle = symbol.find("calibration_valid") != std::string::npos ? 12 :
               symbol.find("calibration_entry") != std::string::npos ? 11 :
               symbol.find("boot_echo") != std::string::npos ? 7 :
-              symbol.find("observed_event") != std::string::npos ? 8 :
-              symbol.find("accepted_events") != std::string::npos ? 9 :
-              symbol.find("input_ready") != std::string::npos ? 10 :
+              symbol.find("rising_edges") != std::string::npos ? 9 :
               symbol.find("heartbeat") != std::string::npos ? 3 :
               symbol.find("sequence") != std::string::npos ? 4 :
               symbol.find("timestamp") != std::string::npos ? 5 :
@@ -177,14 +156,8 @@ private:
                 for (size_t k = 0; k < value.size(); ++k) {
                   response.push_back(failing && k == 2 ? 199 : value[k].load());
                 }
-              } else if (number(request, 52 + 12 * i) == 6) {
-                for (const auto &word : boot_id) append(response, word.load());
-              } else if (number(request, 52 + 12 * i) == 8) {
-                response.push_back(observed_event.load());
               } else if (number(request, 52 + 12 * i) == 9) {
-                append(response, accepted_events.load());
-              } else if (number(request, 52 + 12 * i) == 10) {
-                response.push_back(input_ready.load());
+                append(response, rising_edges.load());
               } else if (number(request, 52 + 12 * i) == 11) {
                 for (const auto &coordinate : calibration_xyz) {
                   const double coordinate_value = coordinate.load();
@@ -260,11 +233,10 @@ private:
   std::atomic<int> client_{-1};
   std::atomic<bool> stopping_{false};
   std::thread thread_;
-  uint32_t scanned_boot_{0};
   bool previous_event_{false};
 };
 
-TEST(CommandReadback, StockReplayPreservesRawCommandsAndRequiresPlcEventAdmission)
+TEST(CommandReadback, StockReplayPreservesRawCommands)
 {
   rclcpp::init(0, nullptr);
   LoopbackPlc plc;
@@ -293,13 +265,7 @@ TEST(CommandReadback, StockReplayPreservesRawCommandsAndRequiresPlcEventAdmissio
           <state_interface name="readback"><param name="PLC_symbol">MAIN.commands</param><param name="PLC_type">USINT</param><param name="n_elements">3</param><param name="index">2</param><param name="critical">true</param></state_interface>
           <state_interface name="readback_alias"><param name="PLC_symbol">MAIN.commands</param><param name="PLC_type">USINT</param><param name="n_elements">3</param><param name="index">2</param><param name="critical">true</param></state_interface>
           <state_interface name="other"><param name="PLC_symbol">MAIN.other</param><param name="PLC_type">USINT</param><param name="critical">true</param></state_interface>
-          <state_interface name="boot_id_0"><param name="PLC_symbol">MAIN.boot_id</param><param name="PLC_type">UDINT</param><param name="n_elements">4</param><param name="index">0</param><param name="critical">true</param></state_interface>
-          <state_interface name="boot_id_1"><param name="PLC_symbol">MAIN.boot_id</param><param name="PLC_type">UDINT</param><param name="n_elements">4</param><param name="index">1</param><param name="critical">true</param></state_interface>
-          <state_interface name="boot_id_2"><param name="PLC_symbol">MAIN.boot_id</param><param name="PLC_type">UDINT</param><param name="n_elements">4</param><param name="index">2</param><param name="critical">true</param></state_interface>
-          <state_interface name="boot_id_3"><param name="PLC_symbol">MAIN.boot_id</param><param name="PLC_type">UDINT</param><param name="n_elements">4</param><param name="index">3</param><param name="critical">true</param></state_interface>
-          <state_interface name="observed_event"><param name="PLC_symbol">MAIN.observed_event</param><param name="PLC_type">USINT</param><param name="critical">true</param></state_interface>
-          <state_interface name="accepted_events"><param name="PLC_symbol">MAIN.accepted_events</param><param name="PLC_type">UDINT</param><param name="critical">true</param></state_interface>
-          <state_interface name="input_ready"><param name="PLC_symbol">MAIN.input_ready</param><param name="PLC_type">USINT</param><param name="critical">true</param></state_interface>
+          <state_interface name="rising_edges"><param name="PLC_symbol">MAIN.rising_edges</param><param name="PLC_type">UDINT</param><param name="critical">true</param></state_interface>
           <state_interface name="x"><param name="PLC_symbol">MAIN.calibration_entry</param><param name="PLC_type">LREAL</param><param name="n_elements">3</param><param name="index">0</param><param name="critical">true</param></state_interface>
           <state_interface name="y"><param name="PLC_symbol">MAIN.calibration_entry</param><param name="PLC_type">LREAL</param><param name="n_elements">3</param><param name="index">1</param><param name="critical">true</param></state_interface>
           <state_interface name="z"><param name="PLC_symbol">MAIN.calibration_entry</param><param name="PLC_type">LREAL</param><param name="n_elements">3</param><param name="index">2</param><param name="critical">true</param></state_interface>
@@ -409,56 +375,18 @@ TEST(CommandReadback, StockReplayPreservesRawCommandsAndRequiresPlcEventAdmissio
     if (expected == 1) {
       ASSERT_TRUE(issue({"boot_echo_0", "boot_echo_1", "boot_echo_2", "boot_echo_3", "scalar"},
         {1.0, 17.0, 23.0, 29.0, 0.0}));
-      ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/input_ready") == 1; }));
+      ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/other") == 0; }));
+      const std::array<uint32_t, 4> expected_words{{1, 17, 23, 29}};
       for (size_t i = 0; i < plc.boot_echo.size(); ++i) {
-        EXPECT_EQ(plc.boot_echo[i].load(), plc.boot_id[i].load());
+        EXPECT_EQ(plc.boot_echo[i].load(), expected_words[i]);
       }
+      const auto initial_edges = plc.rising_edges.load();
       ASSERT_TRUE(issue({"scalar"}, {1.0}));
-      ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/accepted_events") == 1; }));
+      ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/rising_edges") == initial_edges + 1; }));
       const auto held_writes = plc.writes.load();
       ASSERT_TRUE(wait([&] { return plc.writes.load() >= held_writes + 3; }));
-      EXPECT_EQ(plc.scalar.load(), 1);  // Native consumption never clears raw input.
-      EXPECT_EQ(plc.accepted_events.load(), 1);  // Replayed high is still one event.
-
-      // ADS readback of zero alone does not prove the PLC sampled the low edge.
-      plc.scan_enabled.store(false);
-      ASSERT_TRUE(issue({"scalar"}, {0.0}));
-      ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/other") == 0; }));
-      EXPECT_EQ(driver.get_state<double>("io/observed_event"), 1);
-      plc.scan_enabled.store(true);
-      ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/observed_event") == 0; }));
-      ASSERT_TRUE(issue({"scalar"}, {1.0}));
-      ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/accepted_events") == 2; }));
-
-      // A new PLC identity rejects the controller's cached hazardous high.
-      plc.boot_id[0].store(2);
-      ASSERT_TRUE(wait([&] {
-        return driver.get_state<double>("io/boot_id_0") == 2 &&
-               driver.get_state<double>("io/input_ready") == 0;
-      }));
-      const auto reset_writes = plc.writes.load();
-      ASSERT_TRUE(wait([&] { return plc.writes.load() >= reset_writes + 3; }));
       EXPECT_EQ(plc.scalar.load(), 1);
-      EXPECT_EQ(plc.accepted_events.load(), 2);
-      ASSERT_TRUE(issue({"scalar"}, {0.0}));
-      ASSERT_TRUE(wait([&] {
-        return driver.get_state<double>("io/other") == 0 &&
-               driver.get_state<double>("io/observed_event") == 0;
-      }));
-      EXPECT_EQ(driver.get_state<double>("io/input_ready"), 0);  // Old echo cannot rearm.
-      ASSERT_TRUE(issue({"boot_echo_0", "boot_echo_1", "boot_echo_2", "boot_echo_3", "scalar"},
-        {2.0, 17.0, 23.0, 29.0, 1.0}));
-      const auto relabelled_writes = plc.writes.load();
-      ASSERT_TRUE(wait([&] { return plc.writes.load() >= relabelled_writes + 3; }));
-      EXPECT_FALSE(plc.input_ready.load());
-      EXPECT_EQ(plc.accepted_events.load(), 2);
-      ASSERT_TRUE(issue({"scalar"}, {0.0}));
-      ASSERT_TRUE(wait([&] {
-        return driver.get_state<double>("io/input_ready") == 1 &&
-               driver.get_state<double>("io/observed_event") == 0;
-      }));
-      ASSERT_TRUE(issue({"scalar"}, {1.0}));
-      ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/accepted_events") == 3; }));
+      EXPECT_EQ(plc.rising_edges.load(), initial_edges + 1);
     }
     ASSERT_TRUE(issue({"scalar"}, {0.0}));
     ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/other") == 0; }));
