@@ -1516,7 +1516,7 @@ namespace beckhoff_ads_hardware_interface
         never_commanded_interfaces_.store(never_commanded_this_cycle, std::memory_order_relaxed);
         if (first_fallback_interface != nullptr)
         {
-            RCLCPP_WARN_THROTTLE(getLogger(), *logging_throttle_clock_, 5000,
+            RCLCPP_DEBUG_THROTTLE(getLogger(), *logging_throttle_clock_, 5000,
                                  "%lu command interfaces used their configured fallback ('%s' among them).",
                                  static_cast<unsigned long>(fallbacks_this_cycle), first_fallback_interface);
         }
