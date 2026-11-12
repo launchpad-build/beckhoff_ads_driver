@@ -35,6 +35,11 @@ These parameters define the connection to the target PLC.
 | `plc_ams_net_id`   | `string` | The AMS NetID of the target PLC (e.g., "192.168.1.1.1.1"). |
 | `local_ams_net_id` | `string` | The AMS NetID of the computer running ROS.      |
 | `plc_ams_port`     | `string` | The AMS Port of the PLC runtime (e.g., "851").  |
+| `comms_outage_grace_ms` | `number` | Outage grace for reads and writes, default 100 ms. Zero faults on the first failure. |
+| `read_outage_grace_ms` | `number` | Optional read-only override. Defaults to `comms_outage_grace_ms`. Failed prerequisite reads retain unsent commands, with newer queued values taking priority. |
+| `read_staleness_timeout_ms` | `number` | Maximum age of published feedback, default 100 ms. Stale feedback faults independently of the read grace. |
+
+A successful complete read starts a new read-outage interval. Repeated short interruptions remain tolerated while feedback meets the freshness limit. Pending commands wait for a successful read, so communication loss can delay a newly queued Stop until communication recovers or the driver faults.
 
 ### 2. Interface Parameters
 For each `<state_interface>` and `<command_interface>`, you must provide parameters that link it to a PLC variable.

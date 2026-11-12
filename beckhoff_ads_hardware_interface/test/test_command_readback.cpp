@@ -65,8 +65,13 @@ public:
   std::atomic<bool> hold_writes{false};
   std::atomic<bool> hold_reads{false};
   std::atomic<bool> fail_reads{false};
+  std::atomic<bool> drop_read_reply{false};
+  std::atomic<unsigned> dropped_read_replies{0};
   std::atomic<bool> drop_write_reply{false};
   std::atomic<unsigned> read_requests{0};
+  std::atomic<unsigned> positive_array_writes{0};
+  std::array<std::atomic<double>, 3> calibration_xyz{{-0.125, 0.25, 1.5}};
+  std::atomic<uint8_t> calibration_valid{1};
   std::atomic<uint32_t> heartbeat{0}, sequence{0};
   std::atomic<double> timestamp{0};
   std::atomic<unsigned> metadata_writes{0};
@@ -140,6 +145,8 @@ private:
             append(response, 4);
             const std::string symbol(reinterpret_cast<const char *>(request.data() + 48), request.size() - 48);
             const uint32_t handle = symbol.find("boot_id") != std::string::npos ? 6 :
+              symbol.find("calibration_valid") != std::string::npos ? 12 :
+              symbol.find("calibration_entry") != std::string::npos ? 11 :
               symbol.find("boot_echo") != std::string::npos ? 7 :
               symbol.find("observed_event") != std::string::npos ? 8 :
               symbol.find("accepted_events") != std::string::npos ? 9 :
@@ -153,6 +160,10 @@ private:
             ++read_requests;
             while (hold_reads.load() && !stopping_.load()) std::this_thread::sleep_for(1ms);
             scan();
+            if (drop_read_reply.exchange(false)) {
+              ++dropped_read_replies;
+              continue;
+            }
             const uint32_t count = number(request, 36);
             uint32_t size = 4 * count;
             for (uint32_t i = 0; i < count; ++i) size += number(request, 56 + 12 * i);
@@ -174,6 +185,14 @@ private:
                 append(response, accepted_events.load());
               } else if (number(request, 52 + 12 * i) == 10) {
                 response.push_back(input_ready.load());
+              } else if (number(request, 52 + 12 * i) == 11) {
+                for (const auto &coordinate : calibration_xyz) {
+                  const double coordinate_value = coordinate.load();
+                  const auto *bytes = reinterpret_cast<const uint8_t *>(&coordinate_value);
+                  response.insert(response.end(), bytes, bytes + sizeof(coordinate_value));
+                }
+              } else if (number(request, 52 + 12 * i) == 12) {
+                response.push_back(calibration_valid.load());
               } else {
                 response.push_back(failing ? 88 : scalar.load());
               }
@@ -188,6 +207,7 @@ private:
               const uint32_t size = number(request, 56 + i * 12);
               const auto handle = number(request, 52 + i * 12);
               if (handle == 1) {
+                if (request[data] != 0) ++positive_array_writes;
                 for (size_t k = 0; k < value.size(); ++k) value[k].store(request[data + k]);
               } else if (handle == 2) {
                 scalar.store(request[data]);
@@ -280,6 +300,10 @@ TEST(CommandReadback, StockReplayPreservesRawCommandsAndRequiresPlcEventAdmissio
           <state_interface name="observed_event"><param name="PLC_symbol">MAIN.observed_event</param><param name="PLC_type">USINT</param><param name="critical">true</param></state_interface>
           <state_interface name="accepted_events"><param name="PLC_symbol">MAIN.accepted_events</param><param name="PLC_type">UDINT</param><param name="critical">true</param></state_interface>
           <state_interface name="input_ready"><param name="PLC_symbol">MAIN.input_ready</param><param name="PLC_type">USINT</param><param name="critical">true</param></state_interface>
+          <state_interface name="x"><param name="PLC_symbol">MAIN.calibration_entry</param><param name="PLC_type">LREAL</param><param name="n_elements">3</param><param name="index">0</param><param name="critical">true</param></state_interface>
+          <state_interface name="y"><param name="PLC_symbol">MAIN.calibration_entry</param><param name="PLC_type">LREAL</param><param name="n_elements">3</param><param name="index">1</param><param name="critical">true</param></state_interface>
+          <state_interface name="z"><param name="PLC_symbol">MAIN.calibration_entry</param><param name="PLC_type">LREAL</param><param name="n_elements">3</param><param name="index">2</param><param name="critical">true</param></state_interface>
+          <state_interface name="valid"><param name="PLC_symbol">MAIN.calibration_valid</param><param name="PLC_type">BOOL</param><param name="critical">true</param></state_interface>
         </gpio>
       </ros2_control>
     </robot>)";
@@ -368,6 +392,12 @@ TEST(CommandReadback, StockReplayPreservesRawCommandsAndRequiresPlcEventAdmissio
     ASSERT_EQ(controller.on_activate(state), controller_interface::CallbackReturn::SUCCESS);
     ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/readback") == 0; }));
     if (expected == 1) {
+      EXPECT_DOUBLE_EQ(driver.get_state<double>("io/x"), -0.125);
+      EXPECT_DOUBLE_EQ(driver.get_state<double>("io/y"), 0.25);
+      EXPECT_DOUBLE_EQ(driver.get_state<double>("io/z"), 1.5);
+      EXPECT_EQ(driver.get_state<double>("io/valid"), 1);
+      plc.calibration_valid.store(0);
+      ASSERT_TRUE(wait([&] { return driver.get_state<double>("io/valid") == 0; }));
       // Activation now waits for a read before the initial command can be sent.
       ASSERT_TRUE(wait([&] {
         return plc.writes.load() == initial_writes + 1 && driver.get_state<double>("io/other") == 77;
@@ -703,5 +733,134 @@ TEST(CommandReadback, StockReplayPreservesRawCommandsAndRequiresPlcEventAdmissio
   EXPECT_EQ(plc.writes.load(), before_resume + 2);
   EXPECT_EQ(resume_driver.write(params.clock->now(), period), hardware_interface::return_type::OK);
   EXPECT_EQ(resume_driver.on_shutdown(state), hardware_interface::CallbackReturn::SUCCESS);
+
+  // L3H tolerates isolated read loss while keeping its write-failure policy strict.
+  settings.erase("heartbeat_plc_symbol");
+  settings.erase("setpoint_sequence_plc_symbol");
+  settings.erase("setpoint_time_plc_symbol");
+  settings["outage_behaviour"] = "latch";
+  settings["ads_request_timeout_ms"] = "100";
+  settings["read_outage_grace_ms"] = "100";
+  settings["read_staleness_timeout_ms"] = "500";
+  beckhoff_ads_hardware_interface::BeckhoffADSHardwareInterface grace_driver;
+  ASSERT_EQ(grace_driver.init(params), hardware_interface::CallbackReturn::SUCCESS);
+  grace_driver.on_export_state_interfaces();
+  grace_driver.on_export_command_interfaces();
+  ASSERT_EQ(grace_driver.on_configure(state), hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(grace_driver.on_activate(state), hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(grace_driver.read(params.clock->now(), period), hardware_interface::return_type::OK);
+  for (const double next_x : {0.125, 0.375}) {
+    const auto previous_x = grace_driver.get_state<double>("io/x");
+    const auto dropped = plc.dropped_read_replies.load();
+    plc.drop_read_reply.store(true);
+    ASSERT_TRUE(await([&] { return plc.dropped_read_replies.load() > dropped; }));
+    plc.calibration_xyz[0].store(next_x);
+    EXPECT_EQ(grace_driver.read(params.clock->now(), period), hardware_interface::return_type::OK);
+    EXPECT_EQ(grace_driver.get_state<double>("io/x"), previous_x);
+    ASSERT_TRUE(await([&] {
+      const auto result = grace_driver.read(params.clock->now(), period);
+      return result != hardware_interface::return_type::OK ||
+             grace_driver.get_state<double>("io/x") == next_x;
+    }));
+    ASSERT_EQ(grace_driver.read(params.clock->now(), period), hardware_interface::return_type::OK);
+    EXPECT_EQ(grace_driver.get_state<double>("io/x"), next_x);
+    // The second loss is a new outage, before the one-second recovery log settles.
+    std::this_thread::sleep_for(150ms);
+  }
+  // Consecutive transport timeouts still latch a fault once the read grace expires.
+  const auto before_outage = plc.dropped_read_replies.load();
+  const auto before_fault_write = plc.writes.load();
+  plc.drop_read_reply.store(true);
+  ASSERT_TRUE(await([&] { return plc.dropped_read_replies.load() > before_outage; }));
+  plc.drop_read_reply.store(true);
+  grace_driver.set_command("io/unpaired", 55.0);
+  ASSERT_EQ(grace_driver.write(params.clock->now(), period), hardware_interface::return_type::OK);
+  ASSERT_TRUE(await([&] {
+    return grace_driver.read(params.clock->now(), period) == hardware_interface::return_type::ERROR;
+  }));
+  EXPECT_EQ(plc.dropped_read_replies.load(), before_outage + 2);
+  std::this_thread::sleep_for(150ms);
+  EXPECT_EQ(plc.writes.load(), before_fault_write);
+  EXPECT_EQ(grace_driver.on_shutdown(state), hardware_interface::CallbackReturn::SUCCESS);
+
+  // A failed prerequisite read retains unsent data, with a newer Stop taking priority.
+  settings["read_poll_period_ms"] = "10000";
+  beckhoff_ads_hardware_interface::BeckhoffADSHardwareInterface retry_driver;
+  ASSERT_EQ(retry_driver.init(params), hardware_interface::CallbackReturn::SUCCESS);
+  retry_driver.on_export_state_interfaces();
+  retry_driver.on_export_command_interfaces();
+  ASSERT_EQ(retry_driver.on_configure(state), hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(retry_driver.on_activate(state), hardware_interface::CallbackReturn::SUCCESS);
+  const auto before_retry_read = plc.read_requests.load();
+  const auto before_retry_write = plc.writes.load();
+  const auto before_positive_write = plc.positive_array_writes.load();
+  plc.hold_reads.store(true);
+  plc.drop_read_reply.store(true);
+  retry_driver.set_command("io/unpaired", 42.0);
+  ASSERT_EQ(retry_driver.write(params.clock->now(), period), hardware_interface::return_type::OK);
+  ASSERT_TRUE(await([&] { return plc.read_requests.load() > before_retry_read; }));
+  retry_driver.set_command("io/unpaired", 0.0);
+  ASSERT_EQ(retry_driver.write(params.clock->now(), period), hardware_interface::return_type::OK);
+  EXPECT_EQ(plc.writes.load(), before_retry_write);
+  plc.hold_reads.store(false);
+  ASSERT_TRUE(await([&] { return plc.writes.load() > before_retry_write; }));
+  EXPECT_EQ(retry_driver.read(params.clock->now(), period), hardware_interface::return_type::OK);
+  EXPECT_EQ(plc.value[0].load(), 0);
+  EXPECT_EQ(plc.positive_array_writes.load(), before_positive_write);
+
+  // Without a newer command, the unsent value must survive the same failed read exactly once.
+  const auto before_retained_write = plc.writes.load();
+  const auto before_retained_drop = plc.dropped_read_replies.load();
+  plc.drop_read_reply.store(true);
+  retry_driver.set_command("io/unpaired", 41.0);
+  ASSERT_EQ(retry_driver.write(params.clock->now(), period), hardware_interface::return_type::OK);
+  ASSERT_TRUE(await([&] { return plc.dropped_read_replies.load() > before_retained_drop; }));
+  EXPECT_EQ(plc.writes.load(), before_retained_write);
+  ASSERT_TRUE(await([&] { return plc.writes.load() > before_retained_write; }));
+  EXPECT_EQ(plc.value[0].load(), 41);
+  std::this_thread::sleep_for(20ms);
+  EXPECT_EQ(plc.writes.load(), before_retained_write + 1);
+
+  // Shutdown during the retry revokes the retained request before it can reach the PLC.
+  const auto before_shutdown_read = plc.read_requests.load();
+  const auto before_shutdown_write = plc.writes.load();
+  const auto before_shutdown_drop = plc.dropped_read_replies.load();
+  plc.drop_read_reply.store(true);
+  retry_driver.set_command("io/unpaired", 43.0);
+  ASSERT_EQ(retry_driver.write(params.clock->now(), period), hardware_interface::return_type::OK);
+  ASSERT_TRUE(await([&] { return plc.dropped_read_replies.load() > before_shutdown_drop; }));
+  plc.hold_reads.store(true);
+  ASSERT_TRUE(await([&] { return plc.read_requests.load() >= before_shutdown_read + 2; }));
+  auto shutdown_result = hardware_interface::CallbackReturn::ERROR;
+  std::thread shutdown_retry([&] { shutdown_result = retry_driver.on_shutdown(state); });
+  const bool retry_revoked = await([&] {
+    retry_driver.read(params.clock->now(), period);
+    return std::isnan(retry_driver.get_state<double>("io/readback"));
+  });
+  plc.hold_reads.store(false);
+  shutdown_retry.join();
+  EXPECT_TRUE(retry_revoked);
+  EXPECT_EQ(shutdown_result, hardware_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(plc.writes.load(), before_shutdown_write);
+
+  // Read grace must not relax a lost write reply, including hold-last commands.
+  settings["read_poll_period_ms"] = "2";
+  beckhoff_ads_hardware_interface::BeckhoffADSHardwareInterface strict_write_driver;
+  ASSERT_EQ(strict_write_driver.init(params), hardware_interface::CallbackReturn::SUCCESS);
+  strict_write_driver.on_export_state_interfaces();
+  strict_write_driver.on_export_command_interfaces();
+  ASSERT_EQ(strict_write_driver.on_configure(state), hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(strict_write_driver.on_activate(state), hardware_interface::CallbackReturn::SUCCESS);
+  const auto before_strict_write = plc.writes.load();
+  plc.drop_write_reply.store(true);
+  strict_write_driver.set_command("io/scalar", 4.0);
+  ASSERT_EQ(strict_write_driver.write(params.clock->now(), period), hardware_interface::return_type::OK);
+  ASSERT_TRUE(await([&] {
+    return strict_write_driver.read(params.clock->now(), period) == hardware_interface::return_type::ERROR;
+  }));
+  strict_write_driver.set_command("io/scalar", 5.0);
+  EXPECT_EQ(strict_write_driver.write(params.clock->now(), period), hardware_interface::return_type::ERROR);
+  EXPECT_EQ(plc.writes.load(), before_strict_write + 1);
+  EXPECT_EQ(strict_write_driver.on_shutdown(state), hardware_interface::CallbackReturn::SUCCESS);
   rclcpp::shutdown();
 }

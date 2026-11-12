@@ -231,6 +231,26 @@ namespace beckhoff_ads_hardware_interface
                         ex.what(), static_cast<long>(comms_outage_grace_.count()));
         }
 
+        read_outage_grace_ = comms_outage_grace_;
+        try
+        {
+            const auto grace_it = info_.hardware_parameters.find("read_outage_grace_ms");
+            if (grace_it != info_.hardware_parameters.end())
+            {
+                const double ms = std::stod(grace_it->second);
+                if (std::isfinite(ms) && ms >= 0.0 &&
+                    ms < static_cast<double>(std::chrono::milliseconds::max().count()))
+                {
+                    read_outage_grace_ = std::chrono::milliseconds(static_cast<long long>(ms));
+                }
+            }
+        }
+        catch (const std::exception &ex)
+        {
+            RCLCPP_WARN(getLogger(), "Invalid read_outage_grace_ms: %s. Using %ld ms.",
+                        ex.what(), static_cast<long>(read_outage_grace_.count()));
+        }
+
         outage_latches_ = true;
         {
             const auto behaviour_it = info_.hardware_parameters.find("outage_behaviour");
@@ -1221,13 +1241,13 @@ namespace beckhoff_ads_hardware_interface
     {
         const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
         read_failures_total_.fetch_add(1, std::memory_order_relaxed);
-        if (read_consecutive_failures_ == 0)
+        if (read_consecutive_failures_ == 0 || read_recovery_stable_since_)
         {
             read_outage_start_ = now;
         }
         ++read_consecutive_failures_;
         read_recovery_stable_since_.reset();
-        if (now - read_outage_start_ >= comms_outage_grace_)
+        if (now - read_outage_start_ >= read_outage_grace_)
         {
             read_hard_fault_.store(true, std::memory_order_release);
         }
@@ -1331,7 +1351,7 @@ namespace beckhoff_ads_hardware_interface
                     item_failure_start_[i] = item_now;
                 }
                 if (read_instruction.critical &&
-                    item_now - *item_failure_start_[i] >= comms_outage_grace_)
+                    item_now - *item_failure_start_[i] >= read_outage_grace_)
                 {
                     RCLCPP_ERROR_THROTTLE(getLogger(), *logging_throttle_clock_, 1000,
                                           "Critical state interface '%s' has been failing beyond the grace "
@@ -1549,8 +1569,25 @@ namespace beckhoff_ads_hardware_interface
         }
         if (needs_readback && !read_fresh && !read_plc())
         {
-            read_hard_fault_.store(true, std::memory_order_release);
-            io_stop_.store(true, std::memory_order_release);
+            // No write was sent. Preserve its unsent fields while newer commands take priority.
+            next_read_time_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+            std::lock_guard<std::mutex> lock(write_mutex_);
+            if (!io_stop_.load(std::memory_order_acquire) &&
+                !read_hard_fault_.load(std::memory_order_acquire) &&
+                !write_hard_fault_.load(std::memory_order_acquire))
+            {
+                for (size_t i = 0; i < request.values.size(); ++i)
+                {
+                    if (std::isnan(write_pending_request_.values[i]))
+                    {
+                        write_pending_request_.values[i] = request.values[i];
+                    }
+                }
+                write_pending_request_.handoff_stamp = write_pending_
+                    ? std::min(write_pending_request_.handoff_stamp, request.handoff_stamp)
+                    : request.handoff_stamp;
+                write_pending_ = true;
+            }
             return false;
         }
         for (size_t i = 0; i < num_items_write_; ++i)
@@ -1682,8 +1719,7 @@ namespace beckhoff_ads_hardware_interface
                     read_available = read_fresh;
                     if (!read_available)
                     {
-                        next_read_time_ = std::max(next_read_time_,
-                            std::chrono::steady_clock::now() + std::chrono::milliseconds(10));
+                        next_read_time_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
                     }
                 }
                 if (read_available && num_items_read_ > 0 && read_staleness_timeout_ns_ > 0 &&
@@ -1711,7 +1747,8 @@ namespace beckhoff_ads_hardware_interface
                         write_pending_ = false;
                     }
                 }
-                if (send) { write_plc(request, read_fresh); }
+                // A mandatory pre-write read can invalidate the earlier successful read.
+                if (send && !write_plc(request, read_fresh)) { read_available = false; }
                 if (num_items_read_ > 0)
                 {
                     std::unique_lock<std::mutex> lock(write_mutex_);

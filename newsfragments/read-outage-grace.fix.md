@@ -1,0 +1,1 @@
+Allow a separate read outage grace while preserving the configured write-failure policy. Retry unsent partial-array commands after a failed prerequisite read, with newer queued commands and shutdown retaining priority.

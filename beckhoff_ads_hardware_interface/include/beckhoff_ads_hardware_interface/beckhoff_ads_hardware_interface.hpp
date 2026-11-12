@@ -280,8 +280,9 @@ namespace beckhoff_ads_hardware_interface
     // A link must stay good this long before an outage is declared over.
     static constexpr std::chrono::seconds RECOVERY_STABLE_PERIOD{1};
 
-    // Overridable via comms_outage_grace_ms; the default matches the PLC's ROS link watchdog.
+    // Shared outage policy, with an optional read-only override.
     std::chrono::milliseconds comms_outage_grace_{100};
+    std::chrono::milliseconds read_outage_grace_{100};
 
     // outage_behaviour=resume lets a hard fault clear itself on link recovery.
     bool outage_latches_{true};
