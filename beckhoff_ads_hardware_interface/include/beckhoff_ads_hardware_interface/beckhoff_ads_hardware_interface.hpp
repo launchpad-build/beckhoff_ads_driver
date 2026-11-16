@@ -9,455 +9,155 @@
 // Author: Nikola Banovic
 // Contributor: Hajar Bartakh
 
+/**
+ * @file beckhoff_ads_hardware_interface.hpp
+ * @brief ros2_control system interface exchanging its state and command interfaces with a Beckhoff PLC.
+ */
 #ifndef beckhoff_ads_hardware_interface__BECKHOFF_SYSTEM_HPP_
 #define beckhoff_ads_hardware_interface__BECKHOFF_SYSTEM_HPP_
 
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <mutex>
+#include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
-#include <thread>
 #include <vector>
-#include <limits>
 
-#include "hardware_interface/introspection.hpp"
-#include "hardware_interface/system_interface.hpp"
 #include "hardware_interface/handle.hpp"
 #include "hardware_interface/hardware_info.hpp"
+#include "hardware_interface/system_interface.hpp"
 #include "hardware_interface/types/hardware_interface_return_values.hpp"
 #include "rclcpp/macros.hpp"
 #include "rclcpp_lifecycle/state.hpp"
 
-#include "ads/AdsLib.h"
-#include "ads/AdsDevice.h"
+#include "beckhoff_ads_client/ads_client.hpp"
 
-#include "beckhoff_ads_hardware_interface/ads_interface_utilities.hpp"
 namespace beckhoff_ads_hardware_interface
 {
 
-  enum class PLCType
-  {
-    // Using enum instead of raw strings for faster iterations in read/write
-    UNKNOWN,
-    BOOL,
-    LREAL,
-    REAL,
-    UDINT,
-    DINT,
-    INT,
-    UINT,
-    SINT,
-    USINT,
-    BYTE,
-    STRING,
-  };
-
-  enum class CommandFallback
-  {
-    HOLD_LAST,    // keep whatever was packed on the last cycle that carried a command
-    MIRROR_STATE, // send the state interface sharing this PLC symbol, so the target tracks reality
-    ZERO,         // send zero; the right answer for a velocity or effort command
-  };
-
-  enum class WriteValueSource
-  {
-    CONTROLLER,         // a ros2_control command interface
-    HEARTBEAT,          // the interface's own link-liveness counter
-    SETPOINT_SEQUENCE,  // the per-write-cycle setpoint sequence number
-    SETPOINT_TIMESTAMP, // the steady-clock instant the packed setpoints describe
-  };
-
-  // Describes each PLC item (array or single variable) for polling via sum commands.
-  struct ADSDataLayout
-  {
-    // Configured from yaml
-    std::string plc_name_symbolic; // e.g., "MAIN.Joint_Pos_State". Used to get the handle.
-    PLCType plc_type;
-    std::optional<AdsHandle> ads_handle_owner; // RAII owner; releases SYM_HNDBYNAME on destruction. Must outlive any use of ads_handle.
-    uint32_t ads_handle; // PLC Handle value cached for the sum-request headers. Mirrors **ads_handle_owner.
-
-    size_t num_elements;          // 6 for LREAL[6], 1 for single LREAL/BOOL etc.
-    size_t plc_element_byte_size; // byte size of ONE element on PLC (e.g., 8 for LREAL, 1 for BOOL).
-
-    // If we have an identically named command and state interface, in case there are no new commands to be sent to the robot, we want to use the value read in the state interface for the next request.
-    // for mapping the ros2 state interfaces names to the corresponding command interfaces names <command_interface_name, state_interface_name>
-    std::map<std::string, std::string> state_command_interfaces_map_;
-
-    // for unpacking sum read response  [Err1_ULONG,...,ErrN_ULONG | Data1_bytes,...,DataN_bytes]
-    size_t offset_in_read_response_error; // Byte offset where this item's ULONG error code starts.
-    size_t offset_in_read_response_data;  // Byte offset where this item's data starts.
-
-    // for packing sum write response [ADS_ITEM_REQ_HEADER_1,...,ADS_ITEM_REQ_HEADER_N | Data1_bytes,...,DataN_bytes]
-    size_t offset_in_write_request_data; // Byte offset where this item's data starts.
-
-    // For interfaces targeting the same PLC symbol, store all their names with their corresponding index inside a map. This will be useful when calling thr ROS2 set_state and set_command functions.
-    std::map<size_t, std::string> ros2_interfaces_;
-
-    std::map<std::string, CommandFallback> fallback_policies_;
-
-    // Joint position and velocity default to critical; the critical interface parameter overrides.
-    std::map<std::string, bool> critical_policies_;
-
-    // True only when every interface on this symbol declared optional="true".
-    bool optional = false;
-    bool handle_resolved = false;
-  };
-
-  // Packed header for sum read/write request item headers
-  typedef struct
-  {
-    uint32_t indexGroup;   // ADSIGRP_SYM_VALBYHND
-    uint32_t indexOffset;  // The ADS Handle
-    uint32_t NumBytesData; // total num of bytes in this data section
-  } ADS_ITEM_REQ_HEADER;
-
-  struct ReadInstruction
-  {
-    size_t read_buffer_offset_error_code;
-    size_t read_buffer_offset_data;
-    PLCType plc_type;
-    std::string state_interface_name;
-    // Resolved once at configure so read() stays non-blocking on the control loop.
-    hardware_interface::StateInterface::SharedPtr state_handle;
-    bool critical = false;
-  };
-
-  struct WriteInstruction
-  {
-    size_t write_buffer_offset_data;
-    PLCType plc_type;
-    std::string command_interface_name;
-    std::string fallback_state_interface_name; // The state interface name corresponding to the current command interface name
-    CommandFallback fallback = CommandFallback::HOLD_LAST;
-    WriteValueSource source = WriteValueSource::CONTROLLER;
-    bool has_been_commanded = false;
-    // An unseeded field keeps its whole item out of the transmitted request.
-    bool seeded = false;
-    size_t layout_index = 0; // index of the owning layout in ads_item_layouts_write_
-    // Resolved once at configure so write() stays non-blocking. Null for the synthetic sources.
-    hardware_interface::CommandInterface::SharedPtr command_handle;
-    hardware_interface::StateInterface::SharedPtr fallback_state_handle;
-  };
-
-  // One whole decoded SUM-read sample.
-  struct ReadSample
-  {
-    std::vector<double> values; // one per read instruction, in instruction order
-    std::chrono::steady_clock::time_point stamp{};
-    uint64_t sequence = 0; // 0 means no sample has been published yet
-  };
-
-  // The latest packed sum-write request handed from write() to the writer thread.
-  struct PendingWrite
-  {
-    std::vector<uint8_t> buffer;
-    std::vector<size_t> layout_indices; // original layout index of each item in the buffer
-    size_t num_items = 0;
-    std::chrono::steady_clock::time_point handoff_stamp{};
-  };
-
-  class BeckhoffADSHardwareInterface : public hardware_interface::SystemInterface
-  {
-  public:
-    ~BeckhoffADSHardwareInterface() override; // joins the I/O threads if a lifecycle shutdown did not
-
-    hardware_interface::CallbackReturn on_init(const hardware_interface::HardwareComponentInterfaceParams &params) override;
-
-    hardware_interface::CallbackReturn on_configure(
-        const rclcpp_lifecycle::State &previous_state) override;
-
-    hardware_interface::CallbackReturn on_activate(
-        const rclcpp_lifecycle::State &previous_state) override;
-
-    hardware_interface::CallbackReturn on_deactivate(
-        const rclcpp_lifecycle::State &previous_state) override;
-
-    hardware_interface::CallbackReturn on_shutdown(
-        const rclcpp_lifecycle::State &previous_state) override;
-
-    // Entered straight from an ERROR in read()/write(), with no on_deactivate first.
-    hardware_interface::CallbackReturn on_error(
-        const rclcpp_lifecycle::State &previous_state) override;
-
-    hardware_interface::return_type read(
-        const rclcpp::Time &time, const rclcpp::Duration &period) override;
-
-    hardware_interface::return_type write(
-        const rclcpp::Time &time, const rclcpp::Duration &period) override;
-
-  private:
-    rclcpp::Logger getLogger() { return rclcpp::get_logger("BeckhoffADSHardwareInterface"); }
-    std::shared_ptr<rclcpp::Clock> logging_throttle_clock_;
-
-    /**
-     * @brief Decodes well-known ADS error codes into a short hint for log output
-     *
-     * @param error_code ADS return code from the AdsLib
-     * @returns Static text describing the code, or a generic fallback
-     */
-    static const char *adsErrorText(long error_code);
-
-    /**
-     * @brief Parses a command_fallback interface parameter into its enum
-     *
-     * @param policy_str Parameter text: hold_last, mirror_state or zero
-     * @param interface_name Interface the parameter belongs to, for the warning on a bad value
-     * @returns The matching policy, or HOLD_LAST when the text is empty or unrecognised
-     */
-    CommandFallback parseCommandFallback(const std::string &policy_str, const std::string &interface_name);
-
-    /**
-     * @brief Tells whether a state interface declared an initial_value in its description
-     *
-     * @param interface_name The full state interface name
-     * @returns True when the URDF declared a non-empty initial_value for it
-     */
-    bool stateInterfaceHasDeclaredInitialValue(const std::string &interface_name) const;
-
-    /**
-     * @brief Pins the state interfaces of dropped optional symbols to a defined value
-     *
-     * @param dropped_interfaces State interface names whose PLC symbol was dropped
-     */
-    void settle_dropped_state_interfaces(const std::vector<std::string> &dropped_interfaces);
-
-    /**
-     * @brief Records a failed SUM-read round-trip for outage and recovery logs
-     *
-     * Stamps the outage start on the first failure and resets recovery tracking.
-     * Reader thread only.
-     */
-    void record_read_failure();
-
-    /**
-     * @brief Records a failed SUM-write round-trip for outage and recovery logs
-     *
-     * Stamps the outage start on the first failure and resets recovery tracking.
-     * Writer thread only.
-     */
-    void record_write_failure();
-
-    // Synthetic heartbeat name, never exported to ros2_control.
-    static constexpr const char *HEARTBEAT_INTERFACE_NAME = "__ads_link_heartbeat";
-
-    // Synthetic names, never exported to ros2_control.
-    static constexpr const char *SETPOINT_SEQUENCE_INTERFACE_NAME = "__ads_setpoint_sequence";
-    static constexpr const char *SETPOINT_TIMESTAMP_INTERFACE_NAME = "__ads_setpoint_timestamp";
-
-    /**
-     * @brief Classifies which source provides a write instruction's value
-     *
-     * @param interface_name The command interface name, real or synthetic
-     * @returns The source the packing loop draws the value from
-     */
-    static WriteValueSource classifyWriteValueSource(const std::string &interface_name);
-
-    /**
-     * @brief Appends a synthetic single-element write layout for an interface-owned symbol
-     *
-     * @param plc_symbol The PLC symbol the layout targets
-     * @param plc_type The PLC type of the symbol
-     * @param interface_name The synthetic interface name tagging the instruction
-     */
-    void append_synthetic_write_layout(
-        const std::string &plc_symbol, PLCType plc_type, const char *interface_name);
-
-    std::string heartbeat_symbol_;        // PLC symbol to beat on; empty disables the heartbeat
-    uint32_t heartbeat_counter_{0};       // advanced in write(), so control-loop thread only
-
-    std::string setpoint_sequence_symbol_;  // PLC symbol for the sequence; empty disables it
-    std::string setpoint_timestamp_symbol_; // PLC symbol for the timestamp; empty disables it
-    // Advanced once per write() cycle, so control-loop thread only.
-    utilities::SetpointSequenceCounter setpoint_sequence_counter_;
-
-    // Connection target details kept for error logs (populated in configure_ads_device).
-    std::string plc_ip_address_;
-    std::string plc_ams_net_id_str_;
-    uint16_t plc_ams_port_{0};
-
-    // A link must stay good this long before an outage is declared over.
-    static constexpr std::chrono::seconds RECOVERY_STABLE_PERIOD{1};
-
-    // Overridable via comms_outage_grace_ms; the default matches the PLC's ROS link watchdog.
-    std::chrono::milliseconds comms_outage_grace_{100};
-
-    // outage_behaviour=resume lets a hard fault clear itself on link recovery.
-    bool outage_latches_{true};
-
-    // Overridable via read_staleness_timeout_ms; 0 disables; raised to three poll periods when paced reading is slower.
-    long long read_staleness_timeout_ns_{100000000};
-
-    // Overridable via activation_first_sample_timeout_ms; 0 skips the wait.
-    std::chrono::milliseconds activation_first_sample_timeout_{1000};
-    std::atomic<uint64_t> read_samples_published_{0}; // bumped by the reader on every publish
-
-    // ========= PLC ==============================
-
-    // PLC Type and Size Helpers
-    PLCType strToPlcType(const std::string &type_str);
-    size_t plcTypeByteSize(PLCType type_enum);
-
-    // ADS Communication objects
-    // Reset or replace only after stop_io_threads() has joined both I/O threads.
-    // Two local AMS ports on one net id, so the reader and writer never contend for a port.
-    std::unique_ptr<AdsDevice> ads_read_device_;  // owned by the reader thread's round-trips
-    std::unique_ptr<AdsDevice> ads_write_device_; // owned by the writer thread's round-trips
-    bool configure_ads_device();
-
-    // Joins the I/O threads, releases the handles and drops the devices, in that order.
-    void teardown_ads_device();
-
-    // Releases every cached PLC symbol handle (ADSDataLayout::ads_handle_owner). Each handle's
-    // deleter calls DeleteSymbolHandle through the issuing device, so this must run while it
-    // is still alive, i.e. before resetting/replacing it. Otherwise the deleters dereference a
-    // freed device and segfault (seen on Ctrl-C teardown).
-    void release_ads_handles();
-
-    /**
-     * @brief Warns when a joint position or velocity interface is declared as 32-bit REAL
-     *
-     * @param interface_name The full interface name, for the warning
-     * @param description The interface description holding the short interface name
-     * @param is_joint True when the interface belongs to a joint
-     * @param plc_type_str The declared PLC_type parameter text
-     */
-    void warn_if_joint_motion_interface_is_32_bit(
-        const std::string &interface_name,
-        const hardware_interface::InterfaceDescription &description,
-        bool is_joint,
-        const std::string &plc_type_str);
-
-    // Metadata (populated in on interface export)
-    // Describes each variable on the PLC
-    std::vector<ADSDataLayout> ads_item_layouts_read_;
-    std::vector<ADSDataLayout> ads_item_layouts_write_;
-    void ads_read_layout_configure();
-    void ads_write_layout_configure();
-    bool build_sum_read_buffers();
-    bool build_sum_write_buffers();
-
-    // ADS Sum Command Buffers
-    // SENT: List of ADS_ITEM_REQ_HEADER structs
-    // RECEIVED: List of [Err1_ULONG,...,ErrN_ULONG | Data1_bytes,...,DataN_bytes]
-    std::vector<uint8_t> ads_buffer_sum_read_request_;
-    std::vector<uint8_t> ads_buffer_sum_read_response_;
-    size_t num_items_read_ = 0;
-
-    // SENT: List of [ADS_ITEM_REQ_HEADER_1,...,ADS_ITEM_REQ_HEADER_N | Data1_bytes,...,DataN_bytes]
-    // RECEIVED: List of ErrCode_ULONGs
-    std::vector<uint8_t> ads_buffer_sum_write_request_;
-    std::vector<uint8_t> ads_buffer_sum_write_response_;
-    size_t num_items_write_ = 0;
-
-    // Owned by the control loop; the writer thread only sees the handed-over PendingWrite.
-    std::vector<utilities::SumWriteItemSpan> write_item_spans_;
-    std::vector<size_t> identity_layout_indices_;
-    std::vector<uint8_t> write_layout_seeded_;
-    std::vector<uint8_t> ads_buffer_sum_write_compact_;
-    std::vector<size_t> compact_layout_indices_;
-
-    /**
-     * @brief Copies the I/O threads' counters into the introspected mirrors
-     */
-    void refresh_transaction_statistics();
-
-    /**
-     * @brief Registers the ADS transaction statistics with the ros2_control introspection
-     */
-    void register_transaction_statistics();
-
-    // ===== ADS transaction statistics ==========================================
-    std::atomic<long long> read_rtt_ns_{0};
-    std::atomic<long long> write_rtt_ns_{0};
-    std::atomic<long long> write_buffer_age_ns_{0};      // handoff to send start, sampled at dequeue
-    std::atomic<long long> write_handoff_latency_ns_{0}; // handoff to send complete
-    std::atomic<uint64_t> read_transactions_total_{0};
-    std::atomic<uint64_t> write_transactions_total_{0};
-    std::atomic<uint64_t> write_coalesced_total_{0};
-    std::atomic<uint64_t> read_failures_total_{0};
-    std::atomic<uint64_t> write_failures_total_{0};
-
-    // Excludes interfaces nothing has ever commanded.
-    std::atomic<uint64_t> fallback_activations_{0};
-
-    std::atomic<uint64_t> fallback_activations_cycle_{0};
-
-    std::atomic<uint64_t> never_commanded_interfaces_{0};
-
-    // Introspected mirrors. Only the control loop writes these.
-    double stat_read_rtt_ms_{0.0};
-    double stat_write_rtt_ms_{0.0};
-    double stat_write_buffer_age_ms_{0.0};
-    double stat_write_handoff_latency_ms_{0.0};
-    double stat_read_transactions_{0.0};
-    double stat_write_transactions_{0.0};
-    double stat_write_coalesced_{0.0};
-    double stat_read_failures_{0.0};
-    double stat_write_failures_{0.0};
-    double stat_fallback_activations_{0.0};
-    double stat_fallback_activations_per_cycle_{0.0};
-    double stat_never_commanded_interfaces_{0.0};
-    double stat_heartbeat_{0.0};
-    double stat_setpoint_sequence_{0.0};
-    double stat_read_sample_age_ms_{0.0}; // age of the sample read() last published; control loop only
-
-    std::vector<ReadInstruction> ads_read_instructions_;
-    std::vector<WriteInstruction> ads_write_instructions_;
-
-    // ===== Background ADS I/O threads ==========================================
-    // The blocking ADS SUM read/write round-trips are moved off the control loop.
-    // read()/write() only touch lock-free caches and a coalescing buffer, so the
-    // control-loop cycle time no longer depends on PLC/network latency.
-
-    void start_io_threads(); // spawns the writer and reader threads
-    void stop_io_threads();  // signals and joins both worker threads; safe to call when idle
-
-    /**
-     * @brief Applies the configured scheduling policy, priority and affinity to a thread
-     *
-     * @param thread The I/O thread to reschedule
-     * @param thread_name Human-readable thread name for the log messages
-     */
-    void apply_io_thread_scheduling(std::thread &thread, const char *thread_name);
-
-    // Overridable via the io_thread_scheduling_policy, io_thread_priority and io_thread_cpu_affinity parameters.
-    utilities::ThreadSchedulingConfig io_thread_scheduling_;
-
-    // Writer thread: owns the SUM-write round-trip. write() marshals the latest command
-    // buffer, hands it over here, and returns. Only the newest buffer is sent (coalescing).
-    void writer_loop();
-    std::thread write_thread_;
-    std::mutex write_mutex_;
-    std::condition_variable write_cv_;
-    PendingWrite write_pending_request_; // latest packed SUM-write request awaiting send
-    bool write_pending_ = false;                 // a fresh buffer is waiting (guarded by write_mutex_)
-    bool write_stop_ = false;                     // stop request (guarded by write_mutex_)
-    std::atomic<bool> write_hard_fault_{false};   // outage outlived the grace window, surfaced by write()
-    // Consecutive failed SUM-write round-trips, for outage and recovery logs. Writer thread only.
-    size_t write_consecutive_failures_ = 0;
-    std::chrono::steady_clock::time_point write_outage_start_;
-    std::optional<std::chrono::steady_clock::time_point> write_recovery_stable_since_;
-
-    // Reader thread: owns the SUM-read round-trip. Decodes each sample into
-    // polling_read_cache_; read() loads from it without blocking.
-    void reader_loop();
-    std::thread read_thread_;
-    std::atomic<bool> read_stop_{false};
-    std::atomic<bool> read_hard_fault_{false};      // outage outlived the grace window, surfaced by read()
-    utilities::LatestSampleBuffer<ReadSample> read_sample_buffer_;
-    std::vector<double> last_decoded_values_; // reader thread only
-    uint64_t read_sample_sequence_ = 0;       // reader thread only
-    // When each item's current per-item failure streak began; reader thread only.
-    std::vector<std::optional<std::chrono::steady_clock::time_point>> item_failure_start_;
-    long long read_poll_period_ns_ = 0;             // optional pacing between SUM reads; 0 = unpaced
-    // Consecutive failed SUM-read round-trips, for outage and recovery logs. Reader thread only.
-    size_t read_consecutive_failures_ = 0;
-    std::chrono::steady_clock::time_point read_outage_start_;
-    std::optional<std::chrono::steady_clock::time_point> read_recovery_stable_since_;
-  };
-
-} // namespace beckhoff_ads_hardware_interface
-
-#endif // beckhoff_ads_hardware_interface__BECKHOFF_SYSTEM_HPP_
+/** @brief What a command interface sends on a cycle no controller commanded it. */
+enum class CommandFallback
+{
+  HOLD_LAST,
+  MIRROR_STATE,
+  ZERO,
+};
+
+/** @brief A state interface fed by one element of the client's latest sample. */
+struct StateBinding
+{
+  /** @brief Full state interface name. */
+  std::string interface_name;
+  /** @brief Handle resolved at configure, so read() never looks it up by name. */
+  hardware_interface::StateInterface::SharedPtr handle;
+  /** @brief False when its optional PLC symbol was dropped. */
+  bool available{true};
+};
+
+/** @brief A command interface feeding one element of the client's submitted values. */
+struct CommandBinding
+{
+  /** @brief Full command interface name. */
+  std::string interface_name;
+  /** @brief Handle resolved at configure, so write() never looks it up by name. */
+  hardware_interface::CommandInterface::SharedPtr handle;
+  /** @brief Fallback applied on a cycle without a command. */
+  CommandFallback fallback{CommandFallback::HOLD_LAST};
+  /** @brief State interface sharing the PLC symbol element, for the mirror_state fallback. */
+  hardware_interface::StateInterface::SharedPtr fallback_state_handle;
+  /** @brief Whether a controller has ever commanded the interface. */
+  bool has_been_commanded{false};
+  /** @brief False when its optional PLC symbol was dropped. */
+  bool available{true};
+};
+
+/**
+ * @brief ros2_control adapter over beckhoff_ads_client::AdsClient.
+ *
+ * Maps every state and command interface carrying PLC_symbol and PLC_type parameters to one PLC
+ * symbol element, configures the client from the hardware parameters, copies the latest sample into
+ * the state interfaces in read() and submits the command interfaces, after their fallbacks, in write().
+ */
+class BeckhoffADSHardwareInterface : public hardware_interface::SystemInterface
+{
+public:
+  /** @brief Stops the client if no lifecycle shutdown did. */
+  ~BeckhoffADSHardwareInterface() override;
+
+  /** @brief Initialises the base system interface and the log throttle clock. */
+  hardware_interface::CallbackReturn on_init(const hardware_interface::HardwareComponentInterfaceParams & params) override;
+
+  /** @brief Parses the parameters, connects the client and resolves every PLC symbol. */
+  hardware_interface::CallbackReturn on_configure(const rclcpp_lifecycle::State & previous_state) override;
+
+  /** @brief Starts the client and waits for the first PLC sample. */
+  hardware_interface::CallbackReturn on_activate(const rclcpp_lifecycle::State & previous_state) override;
+
+  /** @brief Stops the client's I/O threads. */
+  hardware_interface::CallbackReturn on_deactivate(const rclcpp_lifecycle::State & previous_state) override;
+
+  /** @brief Disconnects the client. */
+  hardware_interface::CallbackReturn on_shutdown(const rclcpp_lifecycle::State & previous_state) override;
+
+  /** @brief Disconnects the client; entered straight from an ERROR in read() or write(). */
+  hardware_interface::CallbackReturn on_error(const rclcpp_lifecycle::State & previous_state) override;
+
+  /** @brief Copies the latest PLC sample into the state interfaces without blocking. */
+  hardware_interface::return_type read(const rclcpp::Time & time, const rclcpp::Duration & period) override;
+
+  /** @brief Hands the commands, after their fallbacks, to the client without blocking. */
+  hardware_interface::return_type write(const rclcpp::Time & time, const rclcpp::Duration & period) override;
+
+private:
+  rclcpp::Logger getLogger() const {return rclcpp::get_logger("BeckhoffADSHardwareInterface");}
+
+  std::optional<beckhoff_ads_client::ClientSettings> parse_client_settings();
+  std::optional<std::string> hardware_parameter(const std::string & name) const;
+  void plan_state_elements(std::vector<beckhoff_ads_client::SymbolElement> & elements);
+  void plan_command_elements(
+    std::vector<beckhoff_ads_client::SymbolElement> & elements, std::vector<CommandFallback> & fallbacks);
+  CommandFallback parseCommandFallback(const std::string & policy_str, const std::string & interface_name);
+  bool stateInterfaceHasDeclaredInitialValue(const std::string & interface_name) const;
+  void warn_if_joint_motion_interface_is_32_bit(
+    const std::string & interface_name, const hardware_interface::InterfaceDescription & description,
+    bool is_joint, const std::string & plc_type_str);
+  void bind_interfaces(
+    const std::vector<beckhoff_ads_client::SymbolElement> & state_elements,
+    const std::vector<beckhoff_ads_client::SymbolElement> & command_elements,
+    const std::vector<CommandFallback> & fallbacks, const beckhoff_ads_client::ConfigureResult & result);
+  void teardown_ads_client();
+  void refresh_transaction_statistics();
+  void register_transaction_statistics();
+
+  std::shared_ptr<rclcpp::Clock> logging_throttle_clock_;
+  beckhoff_ads_client::AdsClient ads_client_;
+  std::chrono::milliseconds activation_first_sample_timeout_{1000};
+  std::chrono::nanoseconds read_staleness_timeout_{std::chrono::milliseconds(100)};
+
+  std::vector<StateBinding> state_bindings_;
+  std::vector<CommandBinding> command_bindings_;
+  std::vector<double> state_values_;
+  std::vector<double> command_values_;
+
+  std::uint64_t fallback_activations_{0};
+
+  double stat_read_rtt_ms_{0.0};
+  double stat_write_rtt_ms_{0.0};
+  double stat_write_buffer_age_ms_{0.0};
+  double stat_write_handoff_latency_ms_{0.0};
+  double stat_read_transactions_{0.0};
+  double stat_write_transactions_{0.0};
+  double stat_write_coalesced_{0.0};
+  double stat_read_failures_{0.0};
+  double stat_write_failures_{0.0};
+  double stat_fallback_activations_{0.0};
+  double stat_fallback_activations_per_cycle_{0.0};
+  double stat_never_commanded_interfaces_{0.0};
+  double stat_heartbeat_{0.0};
+  double stat_setpoint_sequence_{0.0};
+  double stat_read_sample_age_ms_{0.0};
+};
+
+}  // namespace beckhoff_ads_hardware_interface
+
+#endif  // beckhoff_ads_hardware_interface__BECKHOFF_SYSTEM_HPP_

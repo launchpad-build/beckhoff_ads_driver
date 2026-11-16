@@ -1,0 +1,1 @@
+The ADS transport now lives in a new `beckhoff_ads_client` package, a plain C++ library without ROS dependencies, and `beckhoff_ads_hardware_interface` is a thin ros2_control adapter over it with unchanged parameters and behaviour, so other consumers can reuse the same sum read and write, I/O threads, outage handling and statistics.

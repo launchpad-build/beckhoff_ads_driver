@@ -2,38 +2,34 @@ cmake_minimum_required(VERSION 3.8)
 project(beckhoff_ads_hardware_interface)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "(GNU|Clang)")
-  add_compile_options(-Wall -Wextra -Werror=unused-but-set-variable -Werror=return-type -Werror=shadow)
+  add_compile_options(-Wall -Wextra -Wpedantic -Werror=unused-but-set-variable -Werror=return-type -Werror=shadow)
 endif()
 
-# find dependencies
 find_package(ament_cmake REQUIRED)
+find_package(beckhoff_ads_client REQUIRED)
 find_package(hardware_interface REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
-find_package(ads_vendor REQUIRED)
 
 add_library(
   beckhoff_ads_hardware_interface
   SHARED
   src/beckhoff_ads_hardware_interface.cpp
-  src/ads_interface_utilities.cpp
 )
-
+target_compile_features(beckhoff_ads_hardware_interface PUBLIC cxx_std_20)
 target_include_directories(
   beckhoff_ads_hardware_interface
   PUBLIC
   include
 )
 target_link_libraries(beckhoff_ads_hardware_interface PUBLIC
+  beckhoff_ads_client::beckhoff_ads_client
   hardware_interface::hardware_interface
-  hardware_interface::mock_components
   rclcpp::rclcpp
   rclcpp_lifecycle::rclcpp_lifecycle
-  ads_vendor::ads_vendor
 )
 
-# prevent pluginlib from using boost
 target_compile_definitions(beckhoff_ads_hardware_interface PUBLIC "PLUGINLIB__DISABLE_BOOST_FUNCTIONS")
 
 pluginlib_export_plugin_description_file(
@@ -59,29 +55,24 @@ ament_export_libraries(
   beckhoff_ads_hardware_interface
 )
 ament_export_dependencies(
+  beckhoff_ads_client
   hardware_interface
   pluginlib
   rclcpp
   rclcpp_lifecycle
-  ads_vendor
 )
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
-  ament_add_gtest(test_ads_interface_utilities
-    test/test_ads_interface_utilities.cpp
-  )
-  target_link_libraries(test_ads_interface_utilities beckhoff_ads_hardware_interface)
-
   ament_add_gtest(test_interface_initial_value
     test/test_interface_initial_value.cpp
   )
   target_link_libraries(test_interface_initial_value beckhoff_ads_hardware_interface)
 
-  ament_add_gtest(test_latest_sample_buffer
-    test/test_latest_sample_buffer.cpp
+  ament_add_gtest(test_hardware_interface_with_fake_plc
+    test/test_hardware_interface_with_fake_plc.cpp
   )
-  target_link_libraries(test_latest_sample_buffer beckhoff_ads_hardware_interface)
+  target_link_libraries(test_hardware_interface_with_fake_plc beckhoff_ads_hardware_interface)
 endif()
 
 ament_package()

@@ -6,13 +6,13 @@
 // Unauthorized copying of this file, via any medium is strictly prohibited.
 // The file is considered confidential.
 
-#include "beckhoff_ads_hardware_interface/ads_interface_utilities.hpp"
+#include "beckhoff_ads_client/ads_client_utilities.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <stdexcept>
 
-namespace beckhoff_ads_hardware_interface
+namespace beckhoff_ads_client
 {
 namespace utilities
 {
@@ -41,6 +41,44 @@ namespace utilities
     catch (const std::exception &ex)
     {
       result.error = ex.what();
+    }
+    return result;
+  }
+
+  std::optional<std::array<uint8_t, 6>> parseAmsNetId(const std::string &text)
+  {
+    std::array<uint8_t, 6> bytes{};
+    size_t byte_index = 0;
+    size_t start = 0;
+    bool valid = true;
+    while (valid && byte_index < bytes.size())
+    {
+      const size_t dot = text.find('.', start);
+      const bool last_byte = byte_index + 1 == bytes.size();
+      const size_t end = last_byte ? text.size() : dot;
+      if (end == std::string::npos || (last_byte && dot != std::string::npos) || end == start || end - start > 3)
+      {
+        valid = false;
+      }
+      else
+      {
+        unsigned int value = 0;
+        for (size_t position = start; valid && position < end; ++position)
+        {
+          const unsigned char digit = static_cast<unsigned char>(text[position]);
+          valid = std::isdigit(digit) != 0;
+          value = value * 10 + (digit - '0');
+        }
+        valid = valid && value <= 255;
+        bytes[byte_index] = static_cast<uint8_t>(value);
+        start = end + 1;
+        ++byte_index;
+      }
+    }
+    std::optional<std::array<uint8_t, 6>> result;
+    if (valid)
+    {
+      result = bytes;
     }
     return result;
   }
@@ -226,4 +264,4 @@ namespace utilities
   }
 
 } // namespace utilities
-} // namespace beckhoff_ads_hardware_interface
+} // namespace beckhoff_ads_client

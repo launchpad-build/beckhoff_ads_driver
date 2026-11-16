@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>beckhoff_ads_client</name>
+  <version>1.5.0</version>
+  <description>ADS client streaming Beckhoff PLC symbols through sum commands on background reader and writer threads, without ROS dependencies</description>
+  <author email="nikola.banovic@b-robotized.com">Nikola Banovic </author>
+  <maintainer email="nikola.banovic@b-robotized.com">Nikola Banovic</maintainer>
+  <maintainer email="bartakh.hajar@gmail.com">Hajar Bartakh</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>ads_vendor</depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

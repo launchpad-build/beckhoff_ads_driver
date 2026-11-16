@@ -12,9 +12,9 @@
 
 #include <gtest/gtest.h>
 
-#include "beckhoff_ads_hardware_interface/ads_interface_utilities.hpp"
+#include "beckhoff_ads_client/latest_sample_buffer.hpp"
 
-namespace utilities = beckhoff_ads_hardware_interface::utilities;
+namespace utilities = beckhoff_ads_client::utilities;
 
 namespace
 {
@@ -100,4 +100,16 @@ TEST(LatestSampleBuffer, ConcurrentReaderSeesWholeMonotonicSamples)
 
   stop.store(true, std::memory_order_relaxed);
   writer.join();
+}
+
+TEST(LatestSampleBuffer, PublishReportsReplacingASampleTheReaderNeverTook)
+{
+  utilities::LatestSampleBuffer<int> buffer;
+  buffer.writeSlot() = 1;
+  EXPECT_FALSE(buffer.publish());
+  buffer.writeSlot() = 2;
+  EXPECT_TRUE(buffer.publish());
+  EXPECT_TRUE(buffer.refreshReadSlot());
+  buffer.writeSlot() = 3;
+  EXPECT_FALSE(buffer.publish());
 }

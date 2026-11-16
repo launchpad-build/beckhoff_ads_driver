@@ -11,9 +11,9 @@
 
 #include <gtest/gtest.h>
 
-#include "beckhoff_ads_hardware_interface/ads_interface_utilities.hpp"
+#include "beckhoff_ads_client/ads_client_utilities.hpp"
 
-namespace utilities = beckhoff_ads_hardware_interface::utilities;
+namespace utilities = beckhoff_ads_client::utilities;
 
 TEST(ParseAmsPort, AcceptsTheFullValidRange)
 {
@@ -102,7 +102,7 @@ namespace
             0x10, 0x11, 0x20, 0x21, 0x22, 0x30};
   }
 
-  std::vector<beckhoff_ads_hardware_interface::utilities::SumWriteItemSpan> makeSpans()
+  std::vector<beckhoff_ads_client::utilities::SumWriteItemSpan> makeSpans()
   {
     return {{0, 3, 9, 2}, {3, 3, 11, 3}, {6, 3, 14, 1}};
   }
@@ -171,4 +171,22 @@ TEST(ToUpperCopy, ToleratesBytesOutsideTheAsciiRange)
   const std::string result = utilities::toUpperCopy(with_high_bytes);
   EXPECT_EQ(result.substr(0, 3), "LRE");
   EXPECT_EQ(result.back(), 'L');
+}
+
+TEST(ParseAmsNetId, ParsesSixDottedBytes)
+{
+  const auto net_id = utilities::parseAmsNetId("192.168.1.20.1.1");
+  ASSERT_TRUE(net_id.has_value());
+  EXPECT_EQ(*net_id, (std::array<uint8_t, 6>{192, 168, 1, 20, 1, 1}));
+}
+
+TEST(ParseAmsNetId, RejectsMalformedNetIds)
+{
+  EXPECT_FALSE(utilities::parseAmsNetId("").has_value());
+  EXPECT_FALSE(utilities::parseAmsNetId("192.168.1.20.1").has_value());
+  EXPECT_FALSE(utilities::parseAmsNetId("192.168.1.20.1.1.1").has_value());
+  EXPECT_FALSE(utilities::parseAmsNetId("192.168.1.256.1.1").has_value());
+  EXPECT_FALSE(utilities::parseAmsNetId("192.168..20.1.1").has_value());
+  EXPECT_FALSE(utilities::parseAmsNetId("192.168.1.20.1.1x").has_value());
+  EXPECT_FALSE(utilities::parseAmsNetId("192.168.1.20.1.").has_value());
 }

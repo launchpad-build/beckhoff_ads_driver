@@ -8,6 +8,14 @@ The core of this hardware interface is in using **ADS Sum-Commands**. This allow
 
 This package is built upon the [official `beckhoff/ADS` library](https://github.com/Beckhoff/ADS), which handles the low-level ADS protocol communication.
 
+## Packages
+
+* `beckhoff_ads_client`: the ADS transport as a plain C++ library without ROS dependencies: symbol
+  resolution, sum read and write on background threads, outage handling and statistics. See its README.
+* `beckhoff_ads_hardware_interface`: the ros2_control plugin, a thin adapter mapping state and command
+  interfaces onto `beckhoff_ads_client`.
+* `beckhoff_ads_bringup`: an example robot description and launch file.
+
 ---
 
 ## Key Features
